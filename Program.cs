@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Serilog;
+using MEL = Microsoft.Extensions.Logging;
 
 var workspace = Environment.GetEnvironmentVariable("WORKSPACE_PATH") ?? "/data";
 var dbPath = Path.Combine(workspace, "claude-auth.db");
@@ -118,7 +119,7 @@ try
 
     app.MapReverseProxy();
 
-    Log.Information("Claude proxy starting on http://+:5000");
+    Log.Information("Claude proxy starting on http://+:5066");
     Log.Information("Workspace: {Workspace}", workspace);
     Log.Information("Database: {DbPath}", dbPath);
     Log.Information("Logs: {LogPath}", logPath);
@@ -134,7 +135,7 @@ finally
     Log.CloseAndFlush();
 }
 
-static (string? email, string? name) TryDecodeJwt(string token, ILogger logger)
+static (string? email, string? name) TryDecodeJwt(string token, MEL.ILogger logger)
 {
     try
     {

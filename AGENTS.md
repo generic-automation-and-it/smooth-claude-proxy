@@ -76,6 +76,14 @@ sequenceDiagram
 - **Decision**: Keep everything in `Program.cs` with `UserRecord` and `UserUpsertWorker` as the only separate types. No service layer, no repository pattern.
 - **Consequences**: Fast to read and modify. If scope grows beyond ~300 lines, extract middleware into a separate class.
 
+### LADR-004 — Port 5066
+
+- **Date**: 2026-03-13
+- **Status**: Accepted
+- **Context**: Default port 5000 conflicts with macOS AirPlay Receiver (introduced in macOS Monterey). A deterministic, memorable port was needed that avoids well-known assignments (e.g. 5060/5061 SIP, 5432 Postgres, 5672 AMQP).
+- **Decision**: Use port 5066, derived as `sum("claudekeys" ASCII values) mod 1000 + 5000` → `1066 mod 1000 + 5000 = 66 + 5000 = 5066`. Port 5066 has no IANA-assigned service, is not blocked by common firewalls, and its origin is reproducible from the project name.
+- **Consequences**: No conflict with macOS system services. Port is project-specific and self-documenting. Docker `EXPOSE`, `ASPNETCORE_URLS`, and compose mappings must all use 5066.
+
 ## Key Behaviors
 
 - **Auth detection order**: Bearer token checked after API key. If both present, `authType` is "Bearer" (last write wins) but `apiKey` is still captured from `x-api-key`.

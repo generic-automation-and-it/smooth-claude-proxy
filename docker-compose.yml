@@ -2,7 +2,7 @@ services:
   claude-proxy:
     build: .
     ports:
-      - "5000:5000"
+      - "5066:5066"
     volumes:
       - ${CLAUDE_PROXY_DIR:-~/.claude/proxy}:/data
     environment:
