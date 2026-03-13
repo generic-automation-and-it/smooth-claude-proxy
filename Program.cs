@@ -86,14 +86,26 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, user={User}]",
             req.Method, req.Path, req.QueryString, authType, email ?? "unknown");
 
-        if (email is not null)
+        string? bearerToken = null;
+        if (req.Headers.TryGetValue("Authorization", out var bearerHeader))
         {
+            var raw = bearerHeader.ToString().Replace("Bearer ", "");
+            bearerToken = raw.Length > 0 ? raw : null;
+        }
+
+        if (email is not null || bearerToken is not null)
+        {
+            var tokenKey = bearerToken is not null
+                ? (bearerToken.Length > 20 ? "token:" + bearerToken[..10] + bearerToken[^10..] : "token:" + bearerToken)
+                : null;
+
             var channel = context.RequestServices.GetRequiredService<Channel<UserRecord>>();
             await channel.Writer.WriteAsync(new UserRecord
             {
-                Email = email,
+                Email = email ?? tokenKey ?? "unknown",
                 Name = name,
                 ApiKey = apiKey,
+                BearerToken = bearerToken,
                 AnthropicVersion = anthropicVersion,
                 LastUsedUtc = DateTime.UtcNow
             });
@@ -109,7 +121,7 @@ try
             context.Response.StatusCode, req.Method, req.Path);
     });
 
-    app.MapGet("/health", () => Results.Ok(new { status = "ok", target = "https://api.anthropic.com" }));
+    app.MapGet("/health", () => Results.Content("{\"status\":\"ok\",\"target\":\"https://api.anthropic.com\"}", "application/json"));
 
     app.MapGet("/users", (ILiteDatabase db) =>
     {
@@ -179,6 +191,7 @@ public class UserRecord
     public string Email { get; set; } = default!;
     public string? Name { get; set; }
     public string? ApiKey { get; set; }
+    public string? BearerToken { get; set; }
     public string? AnthropicVersion { get; set; }
     public DateTime LastUsedUtc { get; set; }
 }
