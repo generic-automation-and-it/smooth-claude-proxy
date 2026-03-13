@@ -127,8 +127,13 @@ try
 
         await next();
 
-        logger.LogInformation("<- {StatusCode} {Method} {Path}",
-            context.Response.StatusCode, req.Method, req.Path);
+        var status = context.Response.StatusCode;
+        if (status >= 400)
+            logger.LogWarning("<- {StatusCode} {Method} {Path} | PROXY ERROR — Remember you are running via proxy: is it started? do you have a valid key?",
+                status, req.Method, req.Path);
+        else
+            logger.LogInformation("<- {StatusCode} {Method} {Path}",
+                status, req.Method, req.Path);
     });
 
     app.MapOpenApi();
