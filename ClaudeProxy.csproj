@@ -6,10 +6,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
 
-    <!-- R2R + Trimming for faster startup -->
+    <!-- R2R for faster startup; trimming disabled - strips JSON metadata for endpoint types -->
     <PublishReadyToRun>true</PublishReadyToRun>
-    <PublishTrimmed>true</PublishTrimmed>
-    <TrimMode>partial</TrimMode>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
@@ -20,9 +18,5 @@
     <PackageReference Include="Yarp.ReverseProxy" Version="2.1.0" />
   </ItemGroup>
 
-  <!-- Preserve LiteDB reflection-heavy types from trimmer -->
-  <ItemGroup>
-    <TrimmerRootAssembly Include="LiteDB" />
-  </ItemGroup>
 
 </Project>
