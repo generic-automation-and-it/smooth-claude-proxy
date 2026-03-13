@@ -106,6 +106,17 @@ try
             });
         }
 
+        // Override auth headers from active session if one is set
+        var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        if (memCache.TryGetValue<ActiveSession>("active_session", out var activeSession) && activeSession is not null)
+        {
+            req.Headers["Authorization"] = $"Bearer {activeSession.BearerToken}";
+            req.Headers["anthropic-version"] = activeSession.AnthropicVersion;
+            if (activeSession.ApiKey is not null)
+                req.Headers["x-api-key"] = activeSession.ApiKey;
+            logger.LogInformation("Auth overridden from active session: {Email}", activeSession.Email);
+        }
+
         var responseBufferingFeature = context.Features
             .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
         responseBufferingFeature?.DisableBuffering();
