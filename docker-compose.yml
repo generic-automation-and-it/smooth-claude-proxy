@@ -1,0 +1,11 @@
+services:
+  claude-proxy:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ${CLAUDE_PROXY_DIR:-~/.claude/proxy}:/data
+    environment:
+      - WORKSPACE_PATH=/data
+      - LOG_TOKEN_FORMAT=true
+    restart: unless-stopped
