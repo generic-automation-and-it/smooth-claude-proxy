@@ -92,7 +92,10 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, user={User}]",
             req.Method, req.Path, req.QueryString, authType, email ?? "unknown");
 
-        if (bearerToken is not null)
+        var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        memCache.TryGetValue<ActiveSession>("active_session", out var activeSession);
+
+        if (bearerToken is not null && activeSession is null)
         {
             var channel = context.RequestServices.GetRequiredService<Channel<UserRecord>>();
             await channel.Writer.WriteAsync(new UserRecord
@@ -107,8 +110,7 @@ try
         }
 
         // Override auth headers from active session if one is set
-        var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
-        if (memCache.TryGetValue<ActiveSession>("active_session", out var activeSession) && activeSession is not null)
+        if (activeSession is not null)
         {
             req.Headers["Authorization"] = $"Bearer {activeSession.BearerToken}";
             req.Headers["anthropic-version"] = activeSession.AnthropicVersion;
