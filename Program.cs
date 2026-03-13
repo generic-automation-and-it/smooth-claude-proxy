@@ -38,6 +38,7 @@ try
         .AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
+    builder.Services.AddHttpClient();
     builder.Services.AddSingleton<ILiteDatabase>(_ => new LiteDatabase(dbPath));
 
     var upsertChannel = Channel.CreateUnbounded<UserRecord>(
@@ -57,6 +58,7 @@ try
         string? name = null;
         string? apiKey = null;
         string? anthropicVersion = null;
+        string? bearerToken = null;
 
         if (req.Headers.TryGetValue("anthropic-version", out var versionHeader))
             anthropicVersion = versionHeader.ToString();
@@ -70,18 +72,17 @@ try
         if (req.Headers.TryGetValue("Authorization", out var authHeader))
         {
             authType = "Bearer";
-            var token = authHeader.ToString().Replace("Bearer ", "");
-            (email, name) = TryDecodeJwt(token, logger);
+            var raw = authHeader.ToString().Replace("Bearer ", "");
+            bearerToken = raw.Length > 0 ? raw : null;
+            (email, name) = TryDecodeJwt(raw, logger);
         }
 
-        if (Environment.GetEnvironmentVariable("LOG_TOKEN_FORMAT") == "true"
-            && req.Headers.TryGetValue("Authorization", out var rawAuth))
+        if (Environment.GetEnvironmentVariable("LOG_TOKEN_FORMAT") == "true" && bearerToken is not null)
         {
-            var raw = rawAuth.ToString().Replace("Bearer ", "");
-            var parts = raw.Split('.');
-            var masked = raw.Length > 20 ? raw[..10] + "..." + raw[^10..] : "***";
+            var parts = bearerToken.Split('.');
+            var masked = bearerToken.Length > 20 ? bearerToken[..10] + "..." + bearerToken[^10..] : "***";
             logger.LogInformation("[token-debug] format: {Parts} parts, length: {Length}, preview: {Preview}",
-                parts.Length, raw.Length, masked);
+                parts.Length, bearerToken.Length, masked);
             logger.LogInformation("[token-debug] type: {Type}",
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
@@ -89,26 +90,15 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, user={User}]",
             req.Method, req.Path, req.QueryString, authType, email ?? "unknown");
 
-        string? bearerToken = null;
-        if (req.Headers.TryGetValue("Authorization", out var bearerHeader))
+        if (bearerToken is not null)
         {
-            var raw = bearerHeader.ToString().Replace("Bearer ", "");
-            bearerToken = raw.Length > 0 ? raw : null;
-        }
-
-        if (email is not null || bearerToken is not null)
-        {
-            var tokenKey = bearerToken is not null
-                ? (bearerToken.Length > 20 ? "token:" + bearerToken[..10] + bearerToken[^10..] : "token:" + bearerToken)
-                : null;
-
             var channel = context.RequestServices.GetRequiredService<Channel<UserRecord>>();
             await channel.Writer.WriteAsync(new UserRecord
             {
-                Email = email ?? tokenKey ?? "unknown",
+                BearerToken = bearerToken,
+                Email = email,
                 Name = name,
                 ApiKey = apiKey,
-                BearerToken = bearerToken,
                 AnthropicVersion = anthropicVersion,
                 LastUsedUtc = DateTime.UtcNow
             });
@@ -193,10 +183,10 @@ static (string? email, string? name) TryDecodeJwt(string token, MEL.ILogger logg
 public class UserRecord
 {
     [BsonId]
-    public string Email { get; set; } = default!;
+    public string BearerToken { get; set; } = default!;
+    public string? Email { get; set; }
     public string? Name { get; set; }
     public string? ApiKey { get; set; }
-    public string? BearerToken { get; set; }
     public string? AnthropicVersion { get; set; }
     public DateTime LastUsedUtc { get; set; }
 }
@@ -205,30 +195,77 @@ public class UserUpsertWorker : BackgroundService
 {
     private readonly Channel<UserRecord> _channel;
     private readonly ILiteDatabase _db;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<UserUpsertWorker> _logger;
 
-    public UserUpsertWorker(Channel<UserRecord> channel, ILiteDatabase db, ILogger<UserUpsertWorker> logger)
+    public UserUpsertWorker(
+        Channel<UserRecord> channel,
+        ILiteDatabase db,
+        IServiceScopeFactory scopeFactory,
+        ILogger<UserUpsertWorker> logger)
     {
         _channel = channel;
         _db = db;
+        _scopeFactory = scopeFactory;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var col = _db.GetCollection<UserRecord>("users");
-        col.EnsureIndex(x => x.Email, unique: true);
+        col.EnsureIndex(x => x.BearerToken, unique: true);
+        col.EnsureIndex(x => x.Email);
 
         await foreach (var record in _channel.Reader.ReadAllAsync(stoppingToken))
         {
             try
             {
-                col.Upsert(record);
-                _logger.LogInformation("Upserted user: {Email}", record.Email);
+                // Already tracked — skip
+                if (col.FindById(record.BearerToken) is not null)
+                    continue;
+
+                // No email from JWT — try resolving from Anthropic /me
+                if (record.Email is null)
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var httpFactory = scope.ServiceProvider.GetRequiredService<IHttpClientFactory>();
+                    var http = httpFactory.CreateClient();
+                    var req = new HttpRequestMessage(HttpMethod.Get, "https://api.anthropic.com/v1/me");
+                    req.Headers.Add("Authorization", $"Bearer {record.BearerToken}");
+                    req.Headers.Add("anthropic-version", "2023-06-01");
+                    var resp = await http.SendAsync(req, stoppingToken);
+                    if (resp.IsSuccessStatusCode)
+                    {
+                        var json = await resp.Content.ReadAsStringAsync(stoppingToken);
+                        using var doc = JsonDocument.Parse(json);
+                        var root = doc.RootElement;
+                        record.Email = root.TryGetProperty("email", out var em) ? em.GetString() : null;
+                        record.Name  = root.TryGetProperty("name",  out var nm) ? nm.GetString() : record.Name;
+                        _logger.LogInformation("Resolved user from /me: {Email}", record.Email ?? "unknown");
+                    }
+                    else
+                    {
+                        _logger.LogWarning("/me returned {Status} for token", resp.StatusCode);
+                    }
+                }
+
+                // Dedup: if we now have an email, remove other tokens registered to the same email
+                if (record.Email is not null)
+                {
+                    var duplicates = col.Find(x => x.Email == record.Email).ToList();
+                    foreach (var dup in duplicates)
+                    {
+                        col.Delete(dup.BearerToken);
+                        _logger.LogInformation("Removed stale token for {Email}", record.Email);
+                    }
+                }
+
+                col.Insert(record);
+                _logger.LogInformation("Inserted user: {Email}", record.Email ?? "unknown");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Upsert failed for {Email}", record.Email);
+                _logger.LogError(ex, "Insert failed");
             }
         }
     }
