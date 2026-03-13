@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Caching.Memory;
+using Scalar.AspNetCore;
 using Serilog;
 using MEL = Microsoft.Extensions.Logging;
 
@@ -32,6 +33,7 @@ try
         options.AllowSynchronousIO = true;
     });
 
+    builder.Services.AddOpenApi();
     builder.Services.ConfigureHttpJsonOptions(o =>
         o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
 
@@ -129,7 +131,14 @@ try
             context.Response.StatusCode, req.Method, req.Path);
     });
 
-    app.MapGet("/health", () => Results.Content("{\"status\":\"ok\",\"target\":\"https://api.anthropic.com\"}", "application/json"));
+    app.MapOpenApi();
+    app.MapScalarApiReference();
+
+    app.MapGet("/health", () => Results.Content("{\"status\":\"ok\",\"target\":\"https://api.anthropic.com\"}", "application/json"))
+        .WithName("Health")
+        .WithSummary("Health check")
+        .WithDescription("Returns proxy status and upstream target.")
+        .WithTags("Proxy");
 
     app.MapGet("/users", (ILiteDatabase db) =>
     {
@@ -137,7 +146,11 @@ try
         var users = col.FindAll().ToList();
         var json = System.Text.Json.JsonSerializer.Serialize(users, AppJsonContext.Default.ListUserRecord);
         return Results.Content(json, "application/json");
-    });
+    })
+        .WithName("ListUsers")
+        .WithSummary("List tracked users")
+        .WithDescription("Returns all users recorded in LiteDB. BearerToken is the primary key.")
+        .WithTags("Users");
 
     app.MapPost("/active/{email}", (string email, ILiteDatabase db, IMemoryCache cache) =>
     {
@@ -160,7 +173,11 @@ try
             ? session.BearerToken[..10] + "..." + session.BearerToken[^10..]
             : "***";
         return Results.Ok(new { session.Email, session.Name, token = masked, session.AnthropicVersion, session.ActivatedUtc });
-    });
+    })
+        .WithName("SetActiveSession")
+        .WithSummary("Activate a user session")
+        .WithDescription("Loads the user's auth headers into memory cache. All proxied Anthropic requests will use this session's credentials until cleared.")
+        .WithTags("Active Session");
 
     app.MapGet("/active", (IMemoryCache cache) =>
     {
@@ -171,13 +188,21 @@ try
             ? session.BearerToken[..10] + "..." + session.BearerToken[^10..]
             : "***";
         return Results.Ok(new { session.Email, session.Name, token = masked, session.AnthropicVersion, session.ActivatedUtc });
-    });
+    })
+        .WithName("GetActiveSession")
+        .WithSummary("Get current active session")
+        .WithDescription("Returns the currently cached session (bearer token masked). 404 if no session is active.")
+        .WithTags("Active Session");
 
     app.MapDelete("/active", (IMemoryCache cache) =>
     {
         cache.Remove("active_session");
         return Results.Ok(new { status = "active session cleared" });
-    });
+    })
+        .WithName("ClearActiveSession")
+        .WithSummary("Clear active session")
+        .WithDescription("Removes the active session from memory cache. Proxy returns to pass-through mode using the inbound request's own credentials.")
+        .WithTags("Active Session");
 
     app.MapReverseProxy();
 
