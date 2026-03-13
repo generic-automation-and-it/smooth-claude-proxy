@@ -102,6 +102,7 @@ sequenceDiagram
 
 - **Dockerfile target mismatch**: Docker images must match the `TargetFramework` in csproj. Currently aligned at net10.0.
 - **LiteDB AOT incompatibility**: LiteDB uses reflection-heavy BsonMapper. If native AOT is needed in the future, replace with SQLite + Dapper or raw `Microsoft.Data.Sqlite`. Do not attempt `PublishAot=true` with LiteDB — it will compile but fail at runtime with missing metadata.
+- **PublishTrimmed removed**: `TrimMode=partial` strips `JsonTypeInfo` metadata for endpoint return types (`List<UserRecord>` etc.), causing 500s on all `MapGet` endpoints. The ASP.NET Core Request Delegate Generator emits trimming-incompatible serialization code. `PublishReadyToRun=true` is retained for startup speed.
 - **Token format uncertainty**: Claude Code's auth token may not be a JWT. If Anthropic changes to opaque tokens, the JWT decode path returns null gracefully. The `LOG_TOKEN_FORMAT=true` env var exists specifically to diagnose token format changes.
 
 ## Changelog
