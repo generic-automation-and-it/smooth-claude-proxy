@@ -173,6 +173,12 @@ try
         return Results.Ok(new { session.Email, session.Name, token = masked, session.AnthropicVersion, session.ActivatedUtc });
     });
 
+    app.MapDelete("/active", (IMemoryCache cache) =>
+    {
+        cache.Remove("active_session");
+        return Results.Ok(new { status = "active session cleared" });
+    });
+
     app.MapReverseProxy();
 
     Log.Information("Claude proxy starting on http://+:5066");
