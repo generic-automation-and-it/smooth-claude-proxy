@@ -31,6 +31,9 @@ try
         options.AllowSynchronousIO = true;
     });
 
+    builder.Services.ConfigureHttpJsonOptions(o =>
+        o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
+
     builder.Services
         .AddReverseProxy()
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
@@ -127,7 +130,7 @@ try
     {
         var col = db.GetCollection<UserRecord>("users");
         var users = col.FindAll().ToList();
-        var json = System.Text.Json.JsonSerializer.Serialize(users);
+        var json = System.Text.Json.JsonSerializer.Serialize(users, AppJsonContext.Default.ListUserRecord);
         return Results.Content(json, "application/json");
     });
 
@@ -233,3 +236,7 @@ public class UserUpsertWorker : BackgroundService
 
 // Required for ILogger<Program> in top-level statements
 public partial class Program { }
+
+[System.Text.Json.Serialization.JsonSerializable(typeof(List<UserRecord>))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(UserRecord))]
+internal partial class AppJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }
