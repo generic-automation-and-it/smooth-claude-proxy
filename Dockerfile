@@ -4,9 +4,7 @@ COPY ClaudeProxy.csproj .
 RUN dotnet restore
 COPY . .
 RUN dotnet publish -c Release -o /app \
-    /p:PublishReadyToRun=true \
-    /p:PublishTrimmed=true \
-    /p:TrimMode=partial
+    /p:PublishReadyToRun=true
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
 WORKDIR /app
