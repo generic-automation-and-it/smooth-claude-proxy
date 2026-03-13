@@ -8,6 +8,7 @@ using LiteDB;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Caching.Memory;
 using Serilog;
 using MEL = Microsoft.Extensions.Logging;
 
@@ -39,6 +40,7 @@ try
         .LoadFromConfig(builder.Configuration.GetSection("ReverseProxy"));
 
     builder.Services.AddHttpClient();
+    builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<ILiteDatabase>(_ => new LiteDatabase(dbPath));
 
     var upsertChannel = Channel.CreateUnbounded<UserRecord>(
@@ -122,6 +124,40 @@ try
         var users = col.FindAll().ToList();
         var json = System.Text.Json.JsonSerializer.Serialize(users, AppJsonContext.Default.ListUserRecord);
         return Results.Content(json, "application/json");
+    });
+
+    app.MapPost("/active/{email}", (string email, ILiteDatabase db, IMemoryCache cache) =>
+    {
+        var col = db.GetCollection<UserRecord>("users");
+        var user = col.FindOne(x => x.Email == email);
+        if (user is null)
+            return Results.NotFound(new { error = $"No user found for email '{email}'" });
+
+        var session = new ActiveSession
+        {
+            Email = user.Email!,
+            Name = user.Name,
+            BearerToken = user.BearerToken,
+            ApiKey = user.ApiKey,
+            AnthropicVersion = user.AnthropicVersion ?? "2023-06-01",
+            ActivatedUtc = DateTime.UtcNow
+        };
+        cache.Set("active_session", session);
+        var masked = session.BearerToken.Length > 20
+            ? session.BearerToken[..10] + "..." + session.BearerToken[^10..]
+            : "***";
+        return Results.Ok(new { session.Email, session.Name, token = masked, session.AnthropicVersion, session.ActivatedUtc });
+    });
+
+    app.MapGet("/active", (IMemoryCache cache) =>
+    {
+        if (!cache.TryGetValue<ActiveSession>("active_session", out var session) || session is null)
+            return Results.NotFound(new { error = "No active session set" });
+
+        var masked = session.BearerToken.Length > 20
+            ? session.BearerToken[..10] + "..." + session.BearerToken[^10..]
+            : "***";
+        return Results.Ok(new { session.Email, session.Name, token = masked, session.AnthropicVersion, session.ActivatedUtc });
     });
 
     app.MapReverseProxy();
@@ -271,9 +307,20 @@ public class UserUpsertWorker : BackgroundService
     }
 }
 
+public class ActiveSession
+{
+    public string Email { get; set; } = default!;
+    public string? Name { get; set; }
+    public string BearerToken { get; set; } = default!;
+    public string? ApiKey { get; set; }
+    public string AnthropicVersion { get; set; } = "2023-06-01";
+    public DateTime ActivatedUtc { get; set; }
+}
+
 // Required for ILogger<Program> in top-level statements
 public partial class Program { }
 
 [System.Text.Json.Serialization.JsonSerializable(typeof(List<UserRecord>))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(UserRecord))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(ActiveSession))]
 internal partial class AppJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }
