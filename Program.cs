@@ -126,7 +126,9 @@ try
     app.MapGet("/users", (ILiteDatabase db) =>
     {
         var col = db.GetCollection<UserRecord>("users");
-        return Results.Ok(col.FindAll().ToList());
+        var users = col.FindAll().ToList();
+        var json = System.Text.Json.JsonSerializer.Serialize(users);
+        return Results.Content(json, "application/json");
     });
 
     app.MapReverseProxy();
