@@ -1,6 +1,25 @@
 # Claude Code YARP Proxy
 
-A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to impersonate a specific user for all proxied traffic.
+A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to switch between accounts by label.
+
+## Login
+
+Login can be done directly through the proxy. Set the env var first, then log in — the proxy will capture the new token automatically.
+
+```bash
+# 1. Point Claude Code at the proxy
+export ANTHROPIC_BASE_URL=http://localhost:5066
+
+# 2. Log in (opens browser for OAuth) — the proxy captures the new token
+claude login
+
+# 3. Start using Claude — traffic flows through the proxy
+claude
+```
+
+Each unique bearer token is auto-registered in the proxy database with a random label (e.g. "Mina Russel"). Use `GET /users` to see tracked tokens, `PATCH /users/{token}/label` to rename, and `POST /active/{label}` to switch between accounts.
+
+To add another account, repeat the same steps in any terminal that has `ANTHROPIC_BASE_URL` set — each new login is captured and registered automatically.
 
 ## Architecture
 
@@ -31,6 +50,25 @@ docker compose logs -f
 docker compose down
 ```
 
+### Podman Compose
+
+```bash
+# Build and run
+podman-compose up --build -d
+
+# View logs
+podman-compose logs -f
+
+# Stop
+podman-compose down
+```
+
+Rebuild from scratch (when cached layers hide code changes):
+
+```bash
+podman-compose down && podman-compose build --no-cache && podman-compose up -d
+```
+
 ### Podman
 
 ```bash
@@ -55,11 +93,7 @@ export ANTHROPIC_BASE_URL=http://localhost:5066
 claude
 ```
 
-Login must be done directly first (one-time browser OAuth flow):
-
-```bash
-claude login
-```
+Login can be done through the proxy — set `ANTHROPIC_BASE_URL` first, then run `claude login` to capture the new token automatically.
 
 ## Workspace
 
@@ -102,13 +136,13 @@ Override mode: when an active session is set, **all** proxied Anthropic requests
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/active/{email}` | Activate a user session by email |
+| `POST` | `/active/{identifier}` | Activate a session by email or label |
 | `GET` | `/active` | Get current active session (token masked) |
 | `DELETE` | `/active` | Clear active session, resume pass-through mode |
 
 ```bash
-# Activate a user — all subsequent Claude Code requests use their token
-curl -X POST http://localhost:5066/active/user@example.com
+# Activate by label — all subsequent Claude Code requests use their token
+curl -X POST http://localhost:5066/active/Mina%20Russel
 
 # Check who is active
 curl http://localhost:5066/active
@@ -130,5 +164,6 @@ curl -X DELETE http://localhost:5066/active
 1. Claude Code sends requests with `Authorization: Bearer <token>`
 2. If an **active session** is cached, auth headers are replaced before forwarding — inbound token is ignored
 3. Otherwise, the token is recorded to LiteDB via a background channel (non-blocking)
-4. For opaque OAuth tokens (`sk-ant-oat-*`), the worker calls `GET /v1/me` to resolve email/name
+4. New tokens are auto-assigned a random label via Bogus and the active session is cleared so the new token becomes active
 5. YARP forwards the request to `api.anthropic.com`; SSE streaming passes through unbuffered
+6. Unified rate limit headers from the response are captured and persisted per token
