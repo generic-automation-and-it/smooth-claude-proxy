@@ -10,7 +10,7 @@ Transparent YARP reverse proxy that sits between Claude Code CLI and `api.anthro
 - **Never validate JWT signatures** — this proxy intentionally does not verify tokens. It only decodes the payload for identity extraction. Adding verification would break the proxy since we don't have Anthropic's signing keys.
 - **Never log full tokens** — masked preview only (first 10 + last 10 chars). The `LOG_TOKEN_FORMAT` env var controls debug logging; even when enabled, full tokens must not appear in logs.
 - **Never block the request pipeline for DB writes** — all LiteDB operations go through the `Channel<UserRecord>` to the background worker. Synchronous DB access in middleware will add latency to every proxied request.
-- **Email is the BsonId** — LiteDB uses `Email` as the primary key. Changing this breaks all existing databases silently (LiteDB won't migrate).
+- **BearerToken is the BsonId** — LiteDB uses `BearerToken` as the primary key (`[BsonId]`). Email is a secondary non-unique index used for lookups. Changing the primary key breaks all existing databases silently (LiteDB won't migrate).
 
 ## System Context
 
@@ -23,7 +23,7 @@ C4Context
     System_Ext(anthropic, "api.anthropic.com", "Anthropic API")
     System(litedb, "LiteDB", "Embedded user tracking DB")
 
-    Rel(dev, proxy, "ANTHROPIC_BASE_URL=http://localhost:5000")
+    Rel(dev, proxy, "ANTHROPIC_BASE_URL=http://localhost:5066")
     Rel(proxy, anthropic, "Forwards all requests, preserves headers")
     Rel(proxy, litedb, "Async upsert via Channel<T>")
 ```
@@ -39,15 +39,23 @@ sequenceDiagram
     participant DB as LiteDB
 
     CLI->>MW: HTTP request + auth headers
-    MW->>MW: Extract JWT email/name or API key
-    MW->>CH: Write UserRecord (non-blocking)
-    MW->>MW: DisableBuffering()
-    MW->>YARP: next()
-    YARP->>API: Forward request (all headers preserved)
-    API-->>YARP: SSE stream response
-    YARP-->>CLI: Stream passthrough
+    MW->>MW: Extract JWT email or API key
+    MW->>MW: Extract x-user-label header → label
+    MW->>MW: Check IMemoryCache for active_session
+    alt active session set
+        MW->>MW: Override auth headers from session
+    else no active session
+        MW->>MW: DisableBuffering()
+        MW->>YARP: next()
+        YARP->>API: Forward request (all headers preserved)
+        API-->>YARP: SSE stream response + rate limit headers
+        YARP-->>CLI: Stream passthrough
+        MW->>MW: Capture rate limit headers from response
+        MW->>CH: Write UserRecord with token + rate limit data (non-blocking)
+    end
     CH-->>BG: ReadAllAsync
-    BG->>DB: Upsert by Email
+    BG->>BG: FindById — insert new, update changed fields
+    BG->>DB: Upsert by BearerToken
 ```
 
 ## Architecture Decisions
@@ -73,8 +81,8 @@ sequenceDiagram
 - **Date**: 2026-03-13
 - **Status**: Accepted
 - **Context**: The proxy has exactly two concerns: middleware extraction and background DB writes.
-- **Decision**: Keep everything in `Program.cs` with `UserRecord` and `UserUpsertWorker` as the only separate types. No service layer, no repository pattern.
-- **Consequences**: Fast to read and modify. If scope grows beyond ~300 lines, extract middleware into a separate class.
+- **Decision**: Keep everything in `Program.cs` with `UserRecord`, `UserUpsertWorker`, `ActiveSession`, `LabelRequest`, and `AppJsonContext` as the only separate types. No service layer, no repository pattern.
+- **Consequences**: Fast to read and modify. `Program.cs` is currently at ~453 lines — past the original ~300-line threshold. Next significant feature should extract the request middleware into `ProxyMiddleware.cs`.
 
 ### LADR-004 — Port 5066
 
@@ -86,16 +94,37 @@ sequenceDiagram
 
 ## Key Behaviors
 
-- **Auth detection order**: Bearer token checked after API key. If both present, `authType` is "Bearer" (last write wins) but `apiKey` is still captured from `x-api-key`.
-- **JWT claim fallback**: Extracts `email` claim, then `name` claim, falling back to `sub` if no `name`. If the token isn't a JWT (opaque OAuth token), decode fails silently and user is logged as "unknown".
-- **Failed JWT logging exposure**: When email extraction fails, the full JWT claims JSON is logged at Information level. This may include sensitive claims. Only happens for malformed JWTs with decodable payloads but no email claim.
-- **YARP catch-all route**: `{**catch-all}` matches everything including `/health` and `/users` — but `MapGet` endpoints are registered before `MapReverseProxy()`, so they take precedence. Order matters.
+- **Auth detection order**: `x-api-key` is captured first (`authType = "API-Key"`), then `Authorization` header overwrites `authType` to `"Bearer"`. If both are present, `authType` is "Bearer" but `apiKey` is still captured from `x-api-key`.
+- **JWT claim fallback**: Extracts `email` claim, then `name` claim (for future use), falling back to `sub` if no `name`. If the token isn't a JWT (opaque OAuth token), decode fails silently.
+- **Failed JWT logging exposure**: When email extraction fails, the full JWT claims JSON is logged at Information level. This may include sensitive claims. Only happens for decodable JWTs with no `email` claim.
+- **`x-user-label` header**: If present, its value becomes the `Label` for the token. The header is stripped before forwarding to Anthropic — it's proxy-only metadata.
+- **Rate limit header capture**: After each proxied response, `anthropic-ratelimit-input-tokens-remaining`, `anthropic-ratelimit-output-tokens-remaining`, `anthropic-ratelimit-input-tokens-reset`, and `anthropic-ratelimit-output-tokens-reset` are read and persisted with the `UserRecord`. Values are stored as `long` (rounded from the header's double string).
+- **Token-based dedup**: Primary key is `BearerToken`. Each new token gets one DB record. No email-based dedup or stale token deletion currently — one token → one record at rest.
+- **Override session**: `POST /override/{identifier}` loads a user's credentials from LiteDB into `IMemoryCache`, resolved by `Email` or `Label`. All subsequent proxied requests use those credentials (auth headers replaced) and skip DB writes. `DELETE /override` returns to pass-through mode.
+- **Channel write gated on active session**: When an active session is set, the channel write is skipped entirely — no DB record is updated for proxied requests in session mode.
+- **YARP catch-all route**: `{**catch-all}` matches everything — but `MapGet`/`MapPost`/`MapDelete`/`MapPatch` endpoints are registered before `MapReverseProxy()`, so they take precedence. Order matters.
 - **10-minute activity timeout**: YARP's `ActivityTimeout` is set to 10 minutes for long-running Claude requests. Default (100s) will kill streaming responses for complex prompts.
 - **Docker volume**: LiteDB and logs share the same volume mount at `/data`. The `WORKSPACE_PATH` env var controls the container-side path; `CLAUDE_PROXY_DIR` controls the host-side bind mount in compose.
+- **Rolling logs**: 7-day retention (`retainedFileCountLimit: 7`). Log files roll daily.
+- **Non-2xx warning**: Any upstream response with status ≥ 400 logs a `Warning` reminding the operator to check that the proxy is running and the key is valid.
+- **OpenAPI docs**: Scalar UI is served at `/scalar/v1` (via `MapScalarApiReference`). Raw OpenAPI spec at `/openapi/v1.json`.
+
+## API Endpoints
+
+| Method | Path | Description |
+|:-------|:-----|:------------|
+| `GET` | `/health` | Returns `{"status":"ok","target":"https://api.anthropic.com"}` |
+| `GET` | `/logins` | Lists all tracked keys with masked token, label, rate limit remaining, and last used |
+| `PATCH` | `/logins/{bearerToken}/label` | Assigns a friendly name (`Label`) to a tracked bearer token |
+| `POST` | `/override/{identifier}` | Activates a session by email or label; subsequent requests proxy as that user |
+| `GET` | `/override` | Returns current override session (token masked), or 404 |
+| `DELETE` | `/override` | Clears override session; proxy returns to pass-through mode |
+| `GET` | `/openapi/v1.json` | OpenAPI spec |
+| `GET` | `/scalar/v1` | Scalar interactive API docs UI |
 
 ## Quality Constraints
 
-- **Startup time**: Target sub-2s cold start. Published with ReadyToRun + trimming. Do not add heavy DI containers or startup initialization that scans assemblies.
+- **Startup time**: Target sub-2s cold start. Published with ReadyToRun. Do not add heavy DI containers or startup initialization that scans assemblies.
 - **Request overhead**: Middleware must add <1ms to request latency. All IO (DB, heavy logging) must be async and off the hot path.
 
 ## Migration Plans
@@ -104,9 +133,22 @@ sequenceDiagram
 - **LiteDB AOT incompatibility**: LiteDB uses reflection-heavy BsonMapper. If native AOT is needed in the future, replace with SQLite + Dapper or raw `Microsoft.Data.Sqlite`. Do not attempt `PublishAot=true` with LiteDB — it will compile but fail at runtime with missing metadata.
 - **PublishTrimmed removed**: `TrimMode=partial` strips `JsonTypeInfo` metadata for endpoint return types (`List<UserRecord>` etc.), causing 500s on all `MapGet` endpoints. The ASP.NET Core Request Delegate Generator emits trimming-incompatible serialization code. `PublishReadyToRun=true` is retained for startup speed.
 - **Token format uncertainty**: Claude Code's auth token may not be a JWT. If Anthropic changes to opaque tokens, the JWT decode path returns null gracefully. The `LOG_TOKEN_FORMAT=true` env var exists specifically to diagnose token format changes.
+- **Program.cs extraction**: At ~453 lines, the file is past the threshold where extraction becomes worthwhile. The request middleware should move to `ProxyMiddleware.cs` before the next feature is added.
 
 ## Changelog
 
 | Date | Change | Ref |
 |:-----|:-------|:----|
 | 2026-03-13 | Created — initial proxy with YARP, LiteDB, Serilog, Docker support | - |
+| 2026-03-13 | Added override session API (`POST/GET/DELETE /override`) backed by `IMemoryCache` | - |
+| 2026-03-13 | Auth header override from session; channel write skipped when session active | - |
+| 2026-03-13 | `BearerToken` is primary key (`[BsonId]`); email is secondary index only | - |
+| 2026-03-13 | `x-user-label` header support — sets `Label`, stripped before forwarding | - |
+| 2026-03-13 | Rate limit header capture — unified utilization and reset timestamps persisted per token | - |
+| 2026-03-13 | `PATCH /logins/{bearerToken}/label` endpoint for token labeling | - |
+| 2026-03-13 | `POST /override/{identifier}` resolves by email or label | - |
+| 2026-03-13 | OpenAPI docs via Scalar; `/openapi/v1.json` and `/scalar/v1` | - |
+| 2026-03-13 | Warning log on non-2xx upstream responses with proxy hint | - |
+| 2026-03-13 | 7-day rolling log retention | - |
+| 2026-03-13 | Removed `Name` field from UserRecord and responses; kept `Label` from fake name generation | - |
+| 2026-03-13 | Renamed `/users` endpoints to `/logins` | - |
