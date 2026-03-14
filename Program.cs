@@ -16,6 +16,8 @@ using MEL = Microsoft.Extensions.Logging;
 var workspace = Environment.GetEnvironmentVariable("WORKSPACE_PATH") ?? "/data";
 var dbPath = Path.Combine(workspace, "claude-auth.db");
 var logPath = Path.Combine(workspace, "logs", "claude-proxy-.log");
+var localLlmUrl = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"); // env var overrides appsettings
+var localLlmToken = Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"); // env var overrides appsettings
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -51,6 +53,19 @@ try
     builder.Services.AddHostedService<UserUpsertWorker>();
 
     var app = builder.Build();
+
+    // Seed local LLM service routing settings from appsettings.json
+    var startupCache = app.Services.GetRequiredService<IMemoryCache>();
+    var localLlmConfig = builder.Configuration.GetSection("LocalLLMService");
+    localLlmUrl ??= localLlmConfig.GetValue<string>("BaseUrl") ?? "http://host.docker.internal:1234";
+    localLlmToken ??= localLlmConfig.GetValue<string>("AuthToken") ?? "lmstudio";
+    var modelRouteDefaults = new ModelRouteSettings
+    {
+        Enabled = localLlmConfig.GetValue("Enabled", true),
+        FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
+        ToModel = localLlmConfig.GetValue("ToModel", "qwen/qwen2.5-coder-14b")!
+    };
+    startupCache.Set("model_route_settings", modelRouteDefaults);
 
     app.Use(async (context, next) =>
     {
@@ -88,12 +103,16 @@ try
             req.Headers.Remove("x-user-label");
         }
 
+        var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        var modelRoute = memCache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
+
+        // Only read body if model routing is enabled (to extract model field)
         string? model = null;
-        if (req.ContentType?.Contains("application/json") == true && req.ContentLength > 0)
+        if (modelRoute.Enabled && req.ContentType?.Contains("application/json") == true && req.ContentLength > 0)
         {
-            req.EnableBuffering();
             try
             {
+                req.EnableBuffering();
                 using var reader = new StreamReader(req.Body, leaveOpen: true);
                 var body = await reader.ReadToEndAsync();
                 req.Body.Position = 0;
@@ -114,10 +133,203 @@ try
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
 
-        logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}]",
-            req.Method, req.Path, req.QueryString, authType, model ?? "-");
+        var isLmStudioRoute = modelRoute.Enabled
+            && model?.Contains(modelRoute.FromModel, StringComparison.OrdinalIgnoreCase) == true;
+        var routeTarget = isLmStudioRoute ? "LM Studio" : "Anthropic";
 
-        var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
+        logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
+            req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
+
+        // Route matching models to local LLM via LM Studio native chat API
+        if (isLmStudioRoute)
+        {
+            var httpFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
+            using var httpClient = httpFactory.CreateClient();
+            httpClient.Timeout = TimeSpan.FromMinutes(10);
+
+            // Target LM Studio native /api/v1/chat endpoint
+            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/api/v1/chat";
+            using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
+            proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {localLlmToken}");
+
+            // Transform Anthropic Messages request → LM Studio chat request
+            if (req.ContentLength > 0 || req.ContentType is not null)
+            {
+                req.Body.Position = 0;
+                using var bodyReader = new StreamReader(req.Body, leaveOpen: true);
+                var bodyText = await bodyReader.ReadToEndAsync();
+                using var bodyDoc = JsonDocument.Parse(bodyText);
+                var root = bodyDoc.RootElement;
+
+                using var ms = new MemoryStream();
+                using (var w = new Utf8JsonWriter(ms))
+                {
+                    w.WriteStartObject();
+                    w.WriteString("model", modelRoute.ToModel);
+                    w.WriteBoolean("stream", true);
+
+                    if (root.TryGetProperty("max_tokens", out var maxTok))
+                        w.WriteNumber("max_output_tokens", maxTok.GetInt32());
+                    if (root.TryGetProperty("temperature", out var temp))
+                        w.WriteNumber("temperature", temp.GetDouble());
+                    if (root.TryGetProperty("top_p", out var topP))
+                        w.WriteNumber("top_p", topP.GetDouble());
+
+                    // Extract system prompt
+                    string? systemPrompt = null;
+                    if (root.TryGetProperty("system", out var sys))
+                    {
+                        if (sys.ValueKind == JsonValueKind.String)
+                        {
+                            systemPrompt = sys.GetString();
+                        }
+                        else if (sys.ValueKind == JsonValueKind.Array)
+                        {
+                            // Anthropic system can be array of {type:"text", text:"..."}
+                            var sb = new StringBuilder();
+                            foreach (var block in sys.EnumerateArray())
+                            {
+                                if (block.TryGetProperty("text", out var t))
+                                {
+                                    if (sb.Length > 0) sb.Append('\n');
+                                    sb.Append(t.GetString());
+                                }
+                            }
+                            systemPrompt = sb.ToString();
+                        }
+                    }
+                    if (systemPrompt is not null)
+                        w.WriteString("system_prompt", systemPrompt);
+
+                    // Build LM Studio input array from Anthropic messages
+                    w.WriteStartArray("input");
+
+                    if (root.TryGetProperty("messages", out var msgs))
+                    {
+                        foreach (var msg in msgs.EnumerateArray())
+                        {
+                            var role = msg.TryGetProperty("role", out var r) ? r.GetString() : "user";
+                            w.WriteStartObject();
+                            w.WriteString("type", "message");
+                            w.WriteString("role", role);
+
+                            if (msg.TryGetProperty("content", out var content))
+                            {
+                                if (content.ValueKind == JsonValueKind.String)
+                                {
+                                    w.WriteString("text", content.GetString());
+                                }
+                                else if (content.ValueKind == JsonValueKind.Array)
+                                {
+                                    // Flatten content blocks to text
+                                    var sb = new StringBuilder();
+                                    foreach (var block in content.EnumerateArray())
+                                    {
+                                        if (block.TryGetProperty("type", out var bt)
+                                            && bt.GetString() == "text"
+                                            && block.TryGetProperty("text", out var txt))
+                                        {
+                                            if (sb.Length > 0) sb.Append('\n');
+                                            sb.Append(txt.GetString());
+                                        }
+                                    }
+                                    w.WriteString("text", sb.ToString());
+                                }
+                            }
+                            w.WriteEndObject();
+                        }
+                    }
+
+                    w.WriteEndArray(); // input
+                    w.WriteEndObject();
+                }
+
+                var payload = ms.ToArray();
+                proxyReq.Content = new ByteArrayContent(payload);
+                proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+                logger.LogInformation("Translated Anthropic -> LM Studio chat: {From} -> {To}", model, modelRoute.ToModel);
+            }
+
+            var responseBuffering = context.Features
+                .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+            responseBuffering?.DisableBuffering();
+
+            try
+            {
+                using var lmResp = await httpClient.SendAsync(proxyReq, HttpCompletionOption.ResponseHeadersRead);
+
+                if (!lmResp.IsSuccessStatusCode)
+                {
+                    var errorBody = await lmResp.Content.ReadAsStringAsync();
+                    logger.LogWarning("<- {StatusCode} from local LLM: {Error}", (int)lmResp.StatusCode, errorBody);
+                    context.Response.StatusCode = (int)lmResp.StatusCode;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(errorBody);
+                    return;
+                }
+
+                // Translate LM Studio SSE stream → Anthropic SSE stream
+                var msgId = $"msg_{Guid.NewGuid():N}";
+                context.Response.StatusCode = 200;
+                context.Response.ContentType = "text/event-stream; charset=utf-8";
+
+                // Anthropic message_start envelope
+                await context.Response.WriteAsync($"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{modelRoute.ToModel}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n");
+                await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+                await context.Response.Body.FlushAsync();
+
+                await using var stream = await lmResp.Content.ReadAsStreamAsync();
+                using var reader = new StreamReader(stream);
+
+                string? line;
+                while ((line = await reader.ReadLineAsync()) is not null)
+                {
+                    if (!line.StartsWith("data: ")) continue;
+
+                    var data = line["data: ".Length..];
+                    if (data == "[DONE]")
+                    {
+                        await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+                        await context.Response.WriteAsync($"event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":0}}}}\n\n");
+                        await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+                        await context.Response.Body.FlushAsync();
+                        break;
+                    }
+
+                    try
+                    {
+                        using var chunk = JsonDocument.Parse(data);
+                        // LM Studio streaming format: {index: 0, type: "text_chunk", data: "..."}
+                        if (chunk.RootElement.TryGetProperty("type", out var typeElem)
+                            && typeElem.GetString() == "text_chunk"
+                            && chunk.RootElement.TryGetProperty("data", out var textElem))
+                        {
+                            var text = textElem.GetString();
+                            if (!string.IsNullOrEmpty(text))
+                            {
+                                // Escape for JSON
+                                var escaped = System.Text.Json.JsonSerializer.Serialize(text)[1..^1]; // strip surrounding quotes
+                                await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                                await context.Response.Body.FlushAsync();
+                            }
+                        }
+                    }
+                    catch { /* skip unparseable chunks */ }
+                }
+
+                logger.LogInformation("<- 200 POST {Path} [Local LLM via /api/v1/chat]", req.Path);
+            }
+            catch (HttpRequestException ex)
+            {
+                logger.LogError(ex, "Local LLM connection failed at {Url} — is it running?", localLlmUrl);
+                context.Response.StatusCode = 502;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(
+                    $"{{\"error\":\"Local LLM unreachable at {localLlmUrl}: {ex.Message}\"}}");
+            }
+            return;
+        }
+
         memCache.TryGetValue<ActiveSession>("active_session", out var activeSession);
 
         // Override auth headers from active session if one is set
@@ -385,12 +597,60 @@ try
         .WithDescription("Returns utilization and rate limit data for whoever is currently being proxied — the active session override if set, otherwise the inbound bearer token.")
         .WithTags("Usage");
 
+    app.MapGet("/override-model", (IMemoryCache cache) =>
+    {
+        var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
+        return Results.Ok(new
+        {
+            settings.Enabled,
+            settings.FromModel,
+            settings.ToModel,
+            Target = localLlmUrl
+        });
+    })
+        .WithName("GetModelRoute")
+        .WithSummary("Get LM Studio model routing settings")
+        .WithDescription("Returns the current model routing configuration. When enabled, requests matching FromModel are forwarded to LM Studio. If ToModel is set, the model field in the request body is rewritten.")
+        .WithTags("Model Routing");
+
+    app.MapPost("/override-model", (ModelRouteRequest body, IMemoryCache cache) =>
+    {
+        var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
+        if (body.Enabled.HasValue) settings.Enabled = body.Enabled.Value;
+        if (body.FromModel is not null) settings.FromModel = body.FromModel;
+        if (body.ToModel is not null) settings.ToModel = body.ToModel;
+        cache.Set("model_route_settings", settings);
+        return Results.Ok(new
+        {
+            settings.Enabled,
+            settings.FromModel,
+            settings.ToModel,
+            Target = localLlmUrl
+        });
+    })
+        .WithName("SetModelRoute")
+        .WithSummary("Update LM Studio model routing settings")
+        .WithDescription("Updates the model routing config. Set FromModel to the pattern to intercept (e.g. 'Haiku'). Set ToModel to rewrite the model field in the request body (e.g. a model loaded in LM Studio). Set Enabled to false to disable routing. Send empty string for ToModel to clear it.")
+        .WithTags("Model Routing");
+
+    app.MapDelete("/override-model", (IMemoryCache cache) =>
+    {
+        cache.Set("model_route_settings", new ModelRouteSettings());
+        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "qwen/qwen2.5-coder-14b" });
+    })
+        .WithName("ResetModelRoute")
+        .WithSummary("Reset model routing to defaults")
+        .WithDescription("Resets model routing settings to defaults: enabled=true, fromModel=Haiku, toModel=null.")
+        .WithTags("Model Routing");
+
     app.MapReverseProxy();
 
     Log.Information("Claude proxy starting on http://+:5066");
     Log.Information("Workspace: {Workspace}", workspace);
     Log.Information("Database: {DbPath}", dbPath);
     Log.Information("Logs: {LogPath}", logPath);
+    Log.Information("Local LLM: {LocalLlmUrl} (routing '{FromModel}' -> '{ToModel}')",
+        localLlmUrl, modelRouteDefaults.FromModel, modelRouteDefaults.ToModel);
 
     app.Run();
 }
@@ -605,6 +865,20 @@ public class LabelRequest
     public string Label { get; set; } = default!;
 }
 
+public class ModelRouteSettings
+{
+    public bool Enabled { get; set; } = true;
+    public string FromModel { get; set; } = "Haiku";
+    public string ToModel { get; set; } = "qwen/qwen2.5-coder-14b";
+}
+
+public class ModelRouteRequest
+{
+    public bool? Enabled { get; set; }
+    public string? FromModel { get; set; }
+    public string? ToModel { get; set; }
+}
+
 public class ActiveSession
 {
     public string Email { get; set; } = default!;
@@ -621,4 +895,6 @@ public partial class Program { }
 [System.Text.Json.Serialization.JsonSerializable(typeof(UserRecord))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(ActiveSession))]
 [System.Text.Json.Serialization.JsonSerializable(typeof(LabelRequest))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(ModelRouteSettings))]
+[System.Text.Json.Serialization.JsonSerializable(typeof(ModelRouteRequest))]
 internal partial class AppJsonContext : System.Text.Json.Serialization.JsonSerializerContext { }
