@@ -75,7 +75,7 @@ try
     {
         Enabled = localLlmConfig.GetValue("Enabled", true),
         FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
-        ToModel = localLlmConfig.GetValue("ToModel", "qwen/qwen2.5-coder-14b")!
+        ToModel = localLlmConfig.GetValue("ToModel", "liquid/lfm2.5-1.2b")!
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -660,7 +660,7 @@ try
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
         cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "qwen/qwen2.5-coder-14b" });
+        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "liquid/lfm2.5-1.2b" });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
@@ -893,7 +893,7 @@ public class ModelRouteSettings
 {
     public bool Enabled { get; set; } = true;
     public string FromModel { get; set; } = "Haiku";
-    public string ToModel { get; set; } = "qwen/qwen2.5-coder-14b";
+    public string ToModel { get; set; } = "liquid/lfm2.5-1.2b";
 }
 
 public class ModelRouteRequest
