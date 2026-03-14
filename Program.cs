@@ -190,8 +190,9 @@ try
                 }
 
                 // Rewrite model field and filter out unsupported fields for Liquid
+                // tools, metadata, and context_management are Anthropic-specific and cause context bloat
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    { "model", "budget_tokens", "thinking" };
+                    { "model", "budget_tokens", "thinking", "tools", "metadata", "context_management" };
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
