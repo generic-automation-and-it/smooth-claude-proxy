@@ -290,11 +290,11 @@ try
 
                     context.Response.StatusCode = 200;
                     context.Response.ContentType = "text/event-stream; charset=utf-8";
-                    var msgId = $"msg_{Guid.NewGuid():N}";
+                    var jsonMsgId = $"msg_{Guid.NewGuid():N}";
 
                     // Write start event
-                    var startEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
-                    await context.Response.WriteAsync(startEvent);
+                    var jsonStartEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{jsonMsgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
+                    await context.Response.WriteAsync(jsonStartEvent);
                     await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
                     await context.Response.Body.FlushAsync();
 
