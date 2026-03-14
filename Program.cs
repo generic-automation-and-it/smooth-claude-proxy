@@ -342,18 +342,26 @@ try
                                     var endIdx = text.IndexOf("<|tool_call_end|>");
                                     if (endIdx >= 0)
                                     {
+                                        logger.LogInformation("⚙️ Detected tool call end token");
                                         toolCallBuffer.Append(text[..endIdx]);
                                         inToolCall = false;
 
                                         // Try to parse and convert the tool call
-                                        var toolUseJson = LiquidToolTranslator.TryParseAndConvertToolCall(toolCallBuffer.ToString());
+                                        var rawToolCall = toolCallBuffer.ToString();
+                                        logger.LogInformation("Raw Liquid tool call: {RawCall}", rawToolCall);
+
+                                        var toolUseJson = LiquidToolTranslator.TryParseAndConvertToolCall(rawToolCall);
                                         if (toolUseJson is not null)
                                         {
-                                            logger.LogInformation("Converted Liquid tool call to Anthropic: {ToolCall}", toolCallBuffer.ToString());
+                                            logger.LogInformation("✓ Successfully converted Liquid tool: {RawCall} → {AnthrcopicFormat}", rawToolCall, toolUseJson);
                                             // Output tool_use block
                                             var escaped = System.Text.Json.JsonSerializer.Serialize(toolUseJson)[1..^1];
                                             await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"tool_use\",\"json\":\"{escaped}\"}}}}\n\n");
                                             await context.Response.Body.FlushAsync();
+                                        }
+                                        else
+                                        {
+                                            logger.LogWarning("✗ Failed to convert Liquid tool call: {RawCall} (unsupported tool or parse error)", rawToolCall);
                                         }
 
                                         toolCallBuffer.Clear();
@@ -371,6 +379,7 @@ try
                                     var startIdx = text.IndexOf("<|tool_call_start|>");
                                     if (startIdx >= 0)
                                     {
+                                        logger.LogInformation("⚙️ Detected tool call start token");
                                         // Output any buffered text before tool call
                                         textBuffer.Append(text[..startIdx]);
                                         if (textBuffer.Length > 0)
@@ -388,13 +397,13 @@ try
                                     {
                                         // Regular text
                                         textBuffer.Append(text);
+                                        logger.LogDebug("Text chunk: {Text}", text);
                                         text = "";
                                     }
                                 }
                             }
 
-                            if (!string.IsNullOrEmpty(textBuffer.ToString()))
-                                chunkCount++;
+                            chunkCount++;
                         }
                     }
                     catch { /* skip unparseable chunks */ }
