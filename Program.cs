@@ -228,7 +228,7 @@ try
                                     // Simple text content
                                     w.WriteStartObject();
                                     w.WriteString("type", "text");
-                                    w.WriteString("text", content.GetString());
+                                    w.WriteString("content", content.GetString());
                                     w.WriteEndObject();
                                 }
                                 else if (content.ValueKind == JsonValueKind.Array)
@@ -242,7 +242,7 @@ try
                                         {
                                             w.WriteStartObject();
                                             w.WriteString("type", "text");
-                                            w.WriteString("text", txt.GetString());
+                                            w.WriteString("content", txt.GetString());
                                             w.WriteEndObject();
                                         }
                                     }
