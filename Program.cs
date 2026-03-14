@@ -296,6 +296,10 @@ try
 
                 string? line;
                 var chunkCount = 0;
+                var textBuffer = new StringBuilder();
+                var inToolCall = false;
+                var toolCallBuffer = new StringBuilder();
+
                 while ((line = await reader.ReadLineAsync()) is not null)
                 {
                     if (!line.StartsWith("data: ")) continue;
@@ -303,6 +307,14 @@ try
                     var data = line["data: ".Length..];
                     if (data == "[DONE]")
                     {
+                        // Flush any remaining buffered text before finishing
+                        if (textBuffer.Length > 0)
+                        {
+                            var escaped = System.Text.Json.JsonSerializer.Serialize(textBuffer.ToString())[1..^1];
+                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                            await context.Response.Body.FlushAsync();
+                        }
+
                         logger.LogInformation("LM Studio stream completed: {ChunkCount} chunks translated", chunkCount);
                         await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
                         await context.Response.WriteAsync($"event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":0}}}}\n\n");
@@ -319,15 +331,70 @@ try
                             && typeElem.GetString() == "text_chunk"
                             && chunk.RootElement.TryGetProperty("data", out var textElem))
                         {
-                            var text = textElem.GetString();
-                            if (!string.IsNullOrEmpty(text))
+                            var text = textElem.GetString() ?? "";
+
+                            // Handle tool call detection
+                            while (text.Length > 0)
                             {
-                                chunkCount++;
-                                // Escape for JSON
-                                var escaped = System.Text.Json.JsonSerializer.Serialize(text)[1..^1]; // strip surrounding quotes
-                                await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
-                                await context.Response.Body.FlushAsync();
+                                if (inToolCall)
+                                {
+                                    // Look for end of tool call
+                                    var endIdx = text.IndexOf("<|tool_call_end|>");
+                                    if (endIdx >= 0)
+                                    {
+                                        toolCallBuffer.Append(text[..endIdx]);
+                                        inToolCall = false;
+
+                                        // Try to parse and convert the tool call
+                                        var toolUseJson = LiquidToolTranslator.TryParseAndConvertToolCall(toolCallBuffer.ToString());
+                                        if (toolUseJson is not null)
+                                        {
+                                            logger.LogInformation("Converted Liquid tool call to Anthropic: {ToolCall}", toolCallBuffer.ToString());
+                                            // Output tool_use block
+                                            var escaped = System.Text.Json.JsonSerializer.Serialize(toolUseJson)[1..^1];
+                                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"tool_use\",\"json\":\"{escaped}\"}}}}\n\n");
+                                            await context.Response.Body.FlushAsync();
+                                        }
+
+                                        toolCallBuffer.Clear();
+                                        text = text[(endIdx + "<|tool_call_end|>".Length)..];
+                                    }
+                                    else
+                                    {
+                                        toolCallBuffer.Append(text);
+                                        text = "";
+                                    }
+                                }
+                                else
+                                {
+                                    // Look for start of tool call
+                                    var startIdx = text.IndexOf("<|tool_call_start|>");
+                                    if (startIdx >= 0)
+                                    {
+                                        // Output any buffered text before tool call
+                                        textBuffer.Append(text[..startIdx]);
+                                        if (textBuffer.Length > 0)
+                                        {
+                                            var escaped = System.Text.Json.JsonSerializer.Serialize(textBuffer.ToString())[1..^1];
+                                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                                            await context.Response.Body.FlushAsync();
+                                            textBuffer.Clear();
+                                        }
+
+                                        inToolCall = true;
+                                        text = text[(startIdx + "<|tool_call_start|>".Length)..];
+                                    }
+                                    else
+                                    {
+                                        // Regular text
+                                        textBuffer.Append(text);
+                                        text = "";
+                                    }
+                                }
                             }
+
+                            if (!string.IsNullOrEmpty(textBuffer.ToString()))
+                                chunkCount++;
                         }
                     }
                     catch { /* skip unparseable chunks */ }
@@ -901,6 +968,73 @@ public class ModelRouteRequest
     public bool? Enabled { get; set; }
     public string? FromModel { get; set; }
     public string? ToModel { get; set; }
+}
+
+// Tool translator: converts Liquid format tool calls to Anthropic format
+public static class LiquidToolTranslator
+{
+    private static readonly Dictionary<string, ToolDefinition> SupportedTools = new()
+    {
+        { "bash", new ToolDefinition { Name = "bash", Description = "Execute shell command", Params = new[] { "command" } } },
+        { "read", new ToolDefinition { Name = "read", Description = "Read file content", Params = new[] { "file_path" } } },
+        { "glob", new ToolDefinition { Name = "glob", Description = "Find files by pattern", Params = new[] { "pattern" } } },
+        { "grep", new ToolDefinition { Name = "grep", Description = "Search file content", Params = new[] { "pattern" } } },
+        { "edit", new ToolDefinition { Name = "edit", Description = "Edit file", Params = new[] { "file_path", "old_string", "new_string" } } },
+        { "write", new ToolDefinition { Name = "write", Description = "Write file", Params = new[] { "file_path", "content" } } },
+    };
+
+    public class ToolDefinition
+    {
+        public string Name { get; set; } = "";
+        public string Description { get; set; } = "";
+        public string[] Params { get; set; } = Array.Empty<string>();
+    }
+
+    /// <summary>
+    /// Converts Liquid format: tool_name(param1="value1", param2="value2")
+    /// To Anthropic format tool_use block
+    /// </summary>
+    public static string? TryParseAndConvertToolCall(string liquidFormat)
+    {
+        // Parse: tool_name(params...)
+        var match = System.Text.RegularExpressions.Regex.Match(
+            liquidFormat,
+            @"^(\w+)\((.*)\)$",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+
+        if (!match.Success)
+            return null;
+
+        var toolName = match.Groups[1].Value.ToLowerInvariant();
+        var paramsStr = match.Groups[2].Value;
+
+        if (!SupportedTools.TryGetValue(toolName, out var toolDef))
+            return null;
+
+        // Parse parameters: key="value", key2="value2"
+        var input = new Dictionary<string, object>();
+        var paramPattern = @"(\w+)=""([^""]*)""";
+        var paramMatches = System.Text.RegularExpressions.Regex.Matches(paramsStr, paramPattern);
+
+        foreach (System.Text.RegularExpressions.Match m in paramMatches)
+        {
+            var key = m.Groups[1].Value;
+            var value = m.Groups[2].Value;
+            input[key] = value;
+        }
+
+        // Build Anthropic tool_use block
+        var toolId = $"toolu_{Guid.NewGuid():N}".Substring(0, 24); // Mimic Anthropic ID format
+        var toolUse = new
+        {
+            type = "tool_use",
+            id = toolId,
+            name = toolName,
+            input
+        };
+
+        return System.Text.Json.JsonSerializer.Serialize(toolUse);
+    }
 }
 
 public class ActiveSession
