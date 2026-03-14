@@ -152,19 +152,19 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
             req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
 
-        // Route matching models to local LLM via LM Studio native chat API
+        // Route matching models to local LLM via LM Studio Anthropic-compatible endpoint
         if (isLmStudioRoute)
         {
             var httpFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
             using var httpClient = httpFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(10);
 
-            // Target LM Studio native /api/v1/chat endpoint
-            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/api/v1/chat";
+            // Target LM Studio Anthropic-compatible /v1/messages endpoint (no format conversion needed)
+            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/v1/messages";
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
             proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {localLlmToken}");
 
-            // Transform Anthropic Messages request → LM Studio chat request
+            // Forward Anthropic Messages request directly (no conversion needed)
             if (req.ContentLength > 0 || req.ContentType is not null)
             {
                 req.Body.Position = 0;
@@ -173,92 +173,28 @@ try
                 using var bodyDoc = JsonDocument.Parse(bodyText);
                 var root = bodyDoc.RootElement;
 
+                // Rewrite model field only
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
                     w.WriteStartObject();
                     w.WriteString("model", modelRoute.ToModel);
-                    w.WriteBoolean("stream", true);
 
-                    if (root.TryGetProperty("max_tokens", out var maxTok))
-                        w.WriteNumber("max_output_tokens", maxTok.GetInt32());
-                    if (root.TryGetProperty("temperature", out var temp))
-                        w.WriteNumber("temperature", temp.GetDouble());
-                    if (root.TryGetProperty("top_p", out var topP))
-                        w.WriteNumber("top_p", topP.GetDouble());
-
-                    // Extract system prompt
-                    string? systemPrompt = null;
-                    if (root.TryGetProperty("system", out var sys))
+                    // Copy all other fields from original request as-is
+                    foreach (var prop in root.EnumerateObject())
                     {
-                        if (sys.ValueKind == JsonValueKind.String)
+                        if (prop.Name != "model")
                         {
-                            systemPrompt = sys.GetString();
-                        }
-                        else if (sys.ValueKind == JsonValueKind.Array)
-                        {
-                            // Anthropic system can be array of {type:"text", text:"..."}
-                            var sb = new StringBuilder();
-                            foreach (var block in sys.EnumerateArray())
-                            {
-                                if (block.TryGetProperty("text", out var t))
-                                {
-                                    if (sb.Length > 0) sb.Append('\n');
-                                    sb.Append(t.GetString());
-                                }
-                            }
-                            systemPrompt = sb.ToString();
+                            prop.Value.WriteTo(w);
                         }
                     }
-                    if (systemPrompt is not null)
-                        w.WriteString("system_prompt", systemPrompt);
-
-                    // Build LM Studio input array from Anthropic messages
-                    // Convert messages to flat list of text content blocks
-                    w.WriteStartArray("input");
-
-                    if (root.TryGetProperty("messages", out var msgs))
-                    {
-                        foreach (var msg in msgs.EnumerateArray())
-                        {
-                            if (msg.TryGetProperty("content", out var content))
-                            {
-                                if (content.ValueKind == JsonValueKind.String)
-                                {
-                                    // Simple text content
-                                    w.WriteStartObject();
-                                    w.WriteString("type", "text");
-                                    w.WriteString("content", content.GetString());
-                                    w.WriteEndObject();
-                                }
-                                else if (content.ValueKind == JsonValueKind.Array)
-                                {
-                                    // Content block array — extract all text blocks
-                                    foreach (var block in content.EnumerateArray())
-                                    {
-                                        if (block.TryGetProperty("type", out var bt)
-                                            && bt.GetString() == "text"
-                                            && block.TryGetProperty("text", out var txt))
-                                        {
-                                            w.WriteStartObject();
-                                            w.WriteString("type", "text");
-                                            w.WriteString("content", txt.GetString());
-                                            w.WriteEndObject();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    w.WriteEndArray(); // input
                     w.WriteEndObject();
                 }
 
                 var payload = ms.ToArray();
                 proxyReq.Content = new ByteArrayContent(payload);
                 proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-                logger.LogInformation("Translated Anthropic -> LM Studio chat: {From} -> {To}", model, modelRoute.ToModel);
+                logger.LogInformation("Forwarding to LM Studio /v1/messages (Anthropic format): {From} -> {To}", model, modelRoute.ToModel);
             }
 
             var responseBuffering = context.Features
