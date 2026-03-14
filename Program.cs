@@ -174,7 +174,8 @@ try
                 var root = bodyDoc.RootElement;
 
                 // Rewrite model field and filter out unsupported fields for Liquid
-                var fieldsToSkip = new[] { "model", "budget_tokens", "thinking" };
+                var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    { "model", "budget_tokens", "thinking" };
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
@@ -182,6 +183,7 @@ try
                     w.WriteString("model", modelRoute.ToModel);
 
                     // Copy all other fields from original request, except unsupported ones
+                    var filteredFields = new List<string>();
                     foreach (var prop in root.EnumerateObject())
                     {
                         if (!fieldsToSkip.Contains(prop.Name))
@@ -189,8 +191,15 @@ try
                             w.WritePropertyName(prop.Name);
                             prop.Value.WriteTo(w);
                         }
+                        else
+                        {
+                            filteredFields.Add(prop.Name);
+                        }
                     }
                     w.WriteEndObject();
+
+                    if (filteredFields.Count > 0)
+                        logger.LogInformation("Filtered out unsupported fields for Liquid: {Fields}", string.Join(", ", filteredFields));
                 }
 
                 var payload = ms.ToArray();
