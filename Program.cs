@@ -185,6 +185,7 @@ try
                     {
                         if (prop.Name != "model")
                         {
+                            w.WritePropertyName(prop.Name);
                             prop.Value.WriteTo(w);
                         }
                     }
