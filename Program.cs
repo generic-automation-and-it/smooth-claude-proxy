@@ -202,41 +202,40 @@ try
                         w.WriteString("system_prompt", systemPrompt);
 
                     // Build LM Studio input array from Anthropic messages
+                    // Convert messages to flat list of text content blocks
                     w.WriteStartArray("input");
 
                     if (root.TryGetProperty("messages", out var msgs))
                     {
                         foreach (var msg in msgs.EnumerateArray())
                         {
-                            var role = msg.TryGetProperty("role", out var r) ? r.GetString() : "user";
-                            w.WriteStartObject();
-                            w.WriteString("type", "message");
-                            w.WriteString("role", role);
-
                             if (msg.TryGetProperty("content", out var content))
                             {
                                 if (content.ValueKind == JsonValueKind.String)
                                 {
+                                    // Simple text content
+                                    w.WriteStartObject();
+                                    w.WriteString("type", "text");
                                     w.WriteString("text", content.GetString());
+                                    w.WriteEndObject();
                                 }
                                 else if (content.ValueKind == JsonValueKind.Array)
                                 {
-                                    // Flatten content blocks to text
-                                    var sb = new StringBuilder();
+                                    // Content block array — extract all text blocks
                                     foreach (var block in content.EnumerateArray())
                                     {
                                         if (block.TryGetProperty("type", out var bt)
                                             && bt.GetString() == "text"
                                             && block.TryGetProperty("text", out var txt))
                                         {
-                                            if (sb.Length > 0) sb.Append('\n');
-                                            sb.Append(txt.GetString());
+                                            w.WriteStartObject();
+                                            w.WriteString("type", "text");
+                                            w.WriteString("text", txt.GetString());
+                                            w.WriteEndObject();
                                         }
                                     }
-                                    w.WriteString("text", sb.ToString());
                                 }
                             }
-                            w.WriteEndObject();
                         }
                     }
 
