@@ -258,11 +258,76 @@ try
                 await using var stream = await lmResp.Content.ReadAsStreamAsync();
                 using var reader = new StreamReader(stream);
 
+                // Check if response is SSE or plain JSON
+                var firstLine = await reader.ReadLineAsync();
+                var isSSE = firstLine?.StartsWith("event:") == true || firstLine?.StartsWith("data:") == true;
+
+                logger.LogInformation("Response format: {Format}", isSSE ? "SSE" : "JSON");
+
+                if (!isSSE && firstLine is not null)
+                {
+                    // Handle plain JSON response (non-streaming)
+                    var fullResponse = firstLine;
+                    string? line;
+                    while ((line = await reader.ReadLineAsync()) is not null)
+                        fullResponse += line;
+
+                    using var doc = JsonDocument.Parse(fullResponse);
+                    var root = doc.RootElement;
+
+                    // Extract text from response
+                    if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var block in content.EnumerateArray())
+                        {
+                            if (block.TryGetProperty("type", out var type) && type.GetString() == "text"
+                                && block.TryGetProperty("text", out var text))
+                            {
+                                var textContent = text.GetString() ?? "";
+                                var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
+                                await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                                await context.Response.Body.FlushAsync();
+                            }
+                        }
+                    }
+
+                    logger.LogInformation("JSON response processed");
+                    await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+                    await context.Response.WriteAsync("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n");
+                    await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+                    await context.Response.Body.FlushAsync();
+                    return;
+                }
+
+                // Handle SSE response
                 string? line;
                 var chunkCount = 0;
                 var textBuffer = new StringBuilder();
                 var inToolCall = false;
                 var toolCallBuffer = new StringBuilder();
+
+                // Process first line if it exists
+                if (firstLine is not null && firstLine.StartsWith("data: "))
+                {
+                    var data = firstLine["data: ".Length..];
+                    if (data != "[DONE]")
+                    {
+                        // Process the first line
+                        try
+                        {
+                            using var chunk = JsonDocument.Parse(data);
+                            if (chunk.RootElement.TryGetProperty("type", out var typeElem)
+                                && typeElem.GetString() == "text_chunk"
+                                && chunk.RootElement.TryGetProperty("data", out var textElem))
+                            {
+                                var text = textElem.GetString() ?? "";
+                                textBuffer.Append(text);
+                                chunkCount++;
+                            }
+                        }
+                        catch { }
+                    }
+                }
 
                 while ((line = await reader.ReadLineAsync()) is not null)
                 {
