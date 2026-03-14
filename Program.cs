@@ -181,6 +181,14 @@ try
                     requestFields.Add(prop.Name);
                 logger.LogInformation("Request fields: {Fields}", string.Join(", ", requestFields));
 
+                // If tools are present, log their size
+                if (root.TryGetProperty("tools", out var tools))
+                {
+                    var toolsJson = tools.GetRawText();
+                    logger.LogInformation("Tools field size: {Bytes} bytes, tool count: {Count}",
+                        toolsJson.Length, tools.GetArrayLength());
+                }
+
                 // Rewrite model field and filter out unsupported fields for Liquid
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "model", "budget_tokens", "thinking" };
