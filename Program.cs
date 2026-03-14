@@ -279,6 +279,8 @@ try
                     return;
                 }
 
+                logger.LogInformation("<- {StatusCode} from local LLM, starting SSE stream translation", (int)lmResp.StatusCode);
+
                 // Translate LM Studio SSE stream → Anthropic SSE stream
                 var msgId = $"msg_{Guid.NewGuid():N}";
                 context.Response.StatusCode = 200;
@@ -293,6 +295,7 @@ try
                 using var reader = new StreamReader(stream);
 
                 string? line;
+                var chunkCount = 0;
                 while ((line = await reader.ReadLineAsync()) is not null)
                 {
                     if (!line.StartsWith("data: ")) continue;
@@ -300,6 +303,7 @@ try
                     var data = line["data: ".Length..];
                     if (data == "[DONE]")
                     {
+                        logger.LogInformation("LM Studio stream completed: {ChunkCount} chunks translated", chunkCount);
                         await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
                         await context.Response.WriteAsync($"event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":0}}}}\n\n");
                         await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
@@ -318,6 +322,7 @@ try
                             var text = textElem.GetString();
                             if (!string.IsNullOrEmpty(text))
                             {
+                                chunkCount++;
                                 // Escape for JSON
                                 var escaped = System.Text.Json.JsonSerializer.Serialize(text)[1..^1]; // strip surrounding quotes
                                 await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
@@ -328,7 +333,7 @@ try
                     catch { /* skip unparseable chunks */ }
                 }
 
-                logger.LogInformation("<- 200 POST {Path} [Local LLM via /api/v1/chat]", req.Path);
+                logger.LogInformation("<- 200 POST {Path} [Local LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
             }
             catch (HttpRequestException ex)
             {
