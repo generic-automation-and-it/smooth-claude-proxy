@@ -268,9 +268,9 @@ try
                 {
                     // Handle plain JSON response (non-streaming)
                     var fullResponse = firstLine;
-                    string? line;
-                    while ((line = await reader.ReadLineAsync()) is not null)
-                        fullResponse += line;
+                    string? jsonLine;
+                    while ((jsonLine = await reader.ReadLineAsync()) is not null)
+                        fullResponse += jsonLine;
 
                     using var doc = JsonDocument.Parse(fullResponse);
                     var root = doc.RootElement;
