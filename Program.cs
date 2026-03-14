@@ -231,7 +231,13 @@ try
 
             try
             {
+                logger.LogInformation("Sending request to LM Studio: {Url}", targetUrl);
                 using var lmResp = await httpClient.SendAsync(proxyReq, HttpCompletionOption.ResponseHeadersRead);
+
+                logger.LogInformation("<- {StatusCode} from local LLM, content type: {ContentType}, length: {Length}",
+                    (int)lmResp.StatusCode,
+                    lmResp.Content.Headers.ContentType,
+                    lmResp.Content.Headers.ContentLength);
 
                 if (!lmResp.IsSuccessStatusCode)
                 {
@@ -243,15 +249,19 @@ try
                     return;
                 }
 
-                logger.LogInformation("<- {StatusCode} from local LLM, starting SSE stream translation", (int)lmResp.StatusCode);
+                logger.LogInformation("Starting response handling");
 
                 // Translate LM Studio SSE stream → Anthropic SSE stream
                 var msgId = $"msg_{Guid.NewGuid():N}";
                 context.Response.StatusCode = 200;
                 context.Response.ContentType = "text/event-stream; charset=utf-8";
 
+                logger.LogInformation("Setting up SSE response with message ID: {MsgId}", msgId);
+
                 // Anthropic message_start envelope
-                await context.Response.WriteAsync($"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{modelRoute.ToModel}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n");
+                var startEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{modelRoute.ToModel}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
+                logger.LogInformation("Writing SSE start event, length: {Length}", startEvent.Length);
+                await context.Response.WriteAsync(startEvent);
                 await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
                 await context.Response.Body.FlushAsync();
 
@@ -266,16 +276,30 @@ try
 
                 if (!isSSE && firstLine is not null)
                 {
+                    logger.LogInformation("Handling JSON response (non-streaming)");
                     // Handle plain JSON response (non-streaming)
                     var fullResponse = firstLine;
                     string? jsonLine;
                     while ((jsonLine = await reader.ReadLineAsync()) is not null)
                         fullResponse += jsonLine;
 
+                    logger.LogInformation("JSON response body size: {Bytes}", fullResponse.Length);
+
                     using var doc = JsonDocument.Parse(fullResponse);
                     var root = doc.RootElement;
 
+                    context.Response.StatusCode = 200;
+                    context.Response.ContentType = "text/event-stream; charset=utf-8";
+                    var msgId = $"msg_{Guid.NewGuid():N}";
+
+                    // Write start event
+                    var startEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
+                    await context.Response.WriteAsync(startEvent);
+                    await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
+                    await context.Response.Body.FlushAsync();
+
                     // Extract text from response
+                    var textCount = 0;
                     if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var block in content.EnumerateArray())
@@ -284,6 +308,8 @@ try
                                 && block.TryGetProperty("text", out var text))
                             {
                                 var textContent = text.GetString() ?? "";
+                                textCount++;
+                                logger.LogInformation("Extracted text block #{Count}, length: {Length}", textCount, textContent.Length);
                                 var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
                                 await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
                                 await context.Response.Body.FlushAsync();
@@ -291,11 +317,12 @@ try
                         }
                     }
 
-                    logger.LogInformation("JSON response processed");
+                    logger.LogInformation("JSON response processed: {TextBlocks} text blocks sent");
                     await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
                     await context.Response.WriteAsync("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n");
                     await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
                     await context.Response.Body.FlushAsync();
+                    logger.LogInformation("JSON response fully sent to client");
                     return;
                 }
 
