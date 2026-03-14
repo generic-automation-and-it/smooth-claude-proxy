@@ -170,8 +170,16 @@ try
                 req.Body.Position = 0;
                 using var bodyReader = new StreamReader(req.Body, leaveOpen: true);
                 var bodyText = await bodyReader.ReadToEndAsync();
+                logger.LogInformation("Original request body size: {Bytes} bytes", bodyText.Length);
+
                 using var bodyDoc = JsonDocument.Parse(bodyText);
                 var root = bodyDoc.RootElement;
+
+                // Log what fields are in the request
+                var requestFields = new List<string>();
+                foreach (var prop in root.EnumerateObject())
+                    requestFields.Add(prop.Name);
+                logger.LogInformation("Request fields: {Fields}", string.Join(", ", requestFields));
 
                 // Rewrite model field and filter out unsupported fields for Liquid
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
