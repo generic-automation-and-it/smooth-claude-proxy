@@ -173,17 +173,18 @@ try
                 using var bodyDoc = JsonDocument.Parse(bodyText);
                 var root = bodyDoc.RootElement;
 
-                // Rewrite model field only
+                // Rewrite model field and filter out unsupported fields for Liquid
+                var fieldsToSkip = new[] { "model", "budget_tokens", "thinking" };
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
                     w.WriteStartObject();
                     w.WriteString("model", modelRoute.ToModel);
 
-                    // Copy all other fields from original request as-is
+                    // Copy all other fields from original request, except unsupported ones
                     foreach (var prop in root.EnumerateObject())
                     {
-                        if (prop.Name != "model")
+                        if (!fieldsToSkip.Contains(prop.Name))
                         {
                             w.WritePropertyName(prop.Name);
                             prop.Value.WriteTo(w);
