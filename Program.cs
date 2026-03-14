@@ -191,8 +191,41 @@ try
 
                 // Rewrite model field and filter out unsupported fields for Liquid
                 // tools, metadata, and context_management are Anthropic-specific and cause context bloat
+                // Also remove cache_control from nested content blocks (Anthropic-specific)
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "model", "budget_tokens", "thinking", "tools", "metadata", "context_management" };
+                var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    { "cache_control" };
+
+                // Helper to recursively remove nested fields
+                void WriteElementWithoutNested(Utf8JsonWriter writer, JsonElement elem)
+                {
+                    switch (elem.ValueKind)
+                    {
+                        case JsonValueKind.Object:
+                            writer.WriteStartObject();
+                            foreach (var prop in elem.EnumerateObject())
+                            {
+                                if (!fieldsToRemoveNested.Contains(prop.Name))
+                                {
+                                    writer.WritePropertyName(prop.Name);
+                                    WriteElementWithoutNested(writer, prop.Value);
+                                }
+                            }
+                            writer.WriteEndObject();
+                            break;
+                        case JsonValueKind.Array:
+                            writer.WriteStartArray();
+                            foreach (var item in elem.EnumerateArray())
+                                WriteElementWithoutNested(writer, item);
+                            writer.WriteEndArray();
+                            break;
+                        default:
+                            elem.WriteTo(writer);
+                            break;
+                    }
+                }
+
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
@@ -206,7 +239,7 @@ try
                         if (!fieldsToSkip.Contains(prop.Name))
                         {
                             w.WritePropertyName(prop.Name);
-                            prop.Value.WriteTo(w);
+                            WriteElementWithoutNested(w, prop.Value);
                         }
                         else
                         {
