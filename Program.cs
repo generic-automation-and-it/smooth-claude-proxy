@@ -361,6 +361,9 @@ try
             .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
         responseBufferingFeature?.DisableBuffering();
 
+        logger.LogInformation("Anthropic request: {Method} {Path} | Content-Length: {ContentLength}",
+            req.Method, req.Path, req.ContentLength);
+
         await next();
 
         var status = context.Response.StatusCode;
@@ -396,6 +399,11 @@ try
             if (resp.Headers.TryGetValue("anthropic-ratelimit-unified-7d-reset", out var r7d)
                 && long.TryParse(r7d.ToString(), out var r7dVal))
                 reset7d = r7dVal;
+
+            if (util5h.HasValue || util7d.HasValue)
+                logger.LogInformation("Anthropic rate limits: 5h={Util5h}% (reset {Reset5h}), 7d={Util7d}% (reset {Reset7d})",
+                    util5h ?? 0, reset5h.HasValue ? DateTimeOffset.FromUnixTimeSeconds(reset5h.Value).ToString("HH:mm UTC") : "N/A",
+                    util7d ?? 0, reset7d.HasValue ? DateTimeOffset.FromUnixTimeSeconds(reset7d.Value).ToString("HH:mm UTC") : "N/A");
 
             var channel = context.RequestServices.GetRequiredService<Channel<UserRecord>>();
             await channel.Writer.WriteAsync(new UserRecord
