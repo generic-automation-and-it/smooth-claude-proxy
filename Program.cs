@@ -16,6 +16,7 @@ using MEL = Microsoft.Extensions.Logging;
 var workspace = Environment.GetEnvironmentVariable("WORKSPACE_PATH") ?? "/data";
 var dbPath = Path.Combine(workspace, "claude-auth.db");
 var logPath = Path.Combine(workspace, "logs", "claude-proxy-.log");
+var localLlmLogPath = Path.Combine(workspace, "logs", "local-llm-service-.log");
 var localLlmUrl = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"); // env var overrides appsettings
 var localLlmToken = Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"); // env var overrides appsettings
 
@@ -23,6 +24,17 @@ Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     .WriteTo.Async(a => a.Console())
     .WriteTo.Async(a => a.File(logPath, rollingInterval: RollingInterval.Day, retainedFileCountLimit: 7))
+    .WriteTo.Logger(lc => lc
+        .MinimumLevel.Information()
+        .Filter.ByIncludingOnly(le =>
+            le.MessageTemplate?.Text?.Contains("Local LLM", StringComparison.OrdinalIgnoreCase) == true ||
+            le.MessageTemplate?.Text?.Contains("LM Studio", StringComparison.OrdinalIgnoreCase) == true ||
+            le.MessageTemplate?.Text?.Contains("/api/v1/chat", StringComparison.OrdinalIgnoreCase) == true ||
+            le.Properties.ContainsKey("Route") && le.Properties["Route"]?.ToString() == "\"LM Studio\"")
+        .WriteTo.Async(a => a.File(
+            localLlmLogPath,
+            rollingInterval: RollingInterval.Day,
+            retainedFileCountLimit: 7)))
     .CreateLogger();
 
 try
