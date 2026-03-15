@@ -80,6 +80,10 @@ try
         "liquid/lfm2.5-1.2b",
         (sp, key) => new LiquidResponseHandler(sp.GetRequiredService<LiquidToolMapper>()));
 
+    builder.Services.AddKeyedScoped<ILocalLLMResponseHandler>(
+        "qwen/qwen2.5-coder-14b",
+        (sp, key) => new Qwen2_5ResponseHandler());
+
     var upsertChannel = Channel.CreateUnbounded<UserRecord>(
         new UnboundedChannelOptions { SingleReader = true });
     builder.Services.AddSingleton(upsertChannel);
@@ -96,7 +100,9 @@ try
     {
         Enabled = localLlmConfig.GetValue("Enabled", true),
         FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
-        ToModel = localLlmConfig.GetValue("ToModel", "liquid/lfm2.5-1.2b")!
+        ToModel = localLlmConfig.GetValue("ToModel", "liquid/lfm2.5-1.2b")!,
+        IncludedTools = localLlmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
+        AllowedMcpServers = localLlmConfig.GetSection("AllowedMcpServers").Get<List<string>>() ?? new()
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -173,15 +179,22 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
             req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
 
-        // Route matching models to local LLM via LM Studio Anthropic-compatible endpoint
+        // Determine target model type early for endpoint selection
+        var isLiquid = modelRoute.ToModel.Equals("liquid/lfm2.5-1.2b", StringComparison.OrdinalIgnoreCase);
+        var isQwen = modelRoute.ToModel.Contains("qwen", StringComparison.OrdinalIgnoreCase);
+
+        // Route matching models to local LLM via LM Studio
         if (isLmStudioRoute)
         {
             var httpFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
             using var httpClient = httpFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(10);
 
-            // Target LM Studio Anthropic-compatible /v1/messages endpoint (no format conversion needed)
-            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/v1/messages";
+            // Choose endpoint based on model: Qwen uses OpenAI-compatible chat, Liquid uses Anthropic messages
+            var targetUrl = isQwen
+                ? $"{localLlmUrl.TrimEnd('/')}/v1/chat/completions"
+                : $"{localLlmUrl.TrimEnd('/')}/v1/messages";
+            logger.LogInformation("Target endpoint: {Endpoint}", targetUrl.Split('/').Last());
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
             proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {localLlmToken}");
 
@@ -216,6 +229,18 @@ try
                 // Also remove cache_control from nested content blocks (Anthropic-specific)
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "model", "budget_tokens", "thinking", "metadata", "context_management" };
+
+                // For Qwen: skip tool_choice, system, and stream — all handled explicitly
+                // stream must be false for Qwen: Qwen2_5ResponseHandler expects plain JSON, not SSE
+                // For Liquid: skip system — already written with tool injection
+                if (isQwen)
+                {
+                    fieldsToSkip.Add("tool_choice");
+                    fieldsToSkip.Add("system");
+                    fieldsToSkip.Add("stream");
+                }
+                if (isLiquid)
+                    fieldsToSkip.Add("system");
                 var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "cache_control" };
 
@@ -254,58 +279,196 @@ try
                     w.WriteStartObject();
                     w.WriteString("model", modelRoute.ToModel);
 
-                    // Build tools JSON for Liquid format (expected in system prompt)
-                    var liquidToolsJson = new List<object>();
-                    if (root.TryGetProperty("tools", out var toolsField))
-                    {
-                        var liquidTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                            { "bash", "read", "write", "edit", "glob", "grep" };
-                        foreach (var tool in toolsField.EnumerateArray())
-                        {
-                            if (tool.TryGetProperty("name", out var n) && liquidTools.Contains(n.GetString() ?? ""))
-                            {
-                                liquidToolsJson.Add(tool);
-                            }
-                        }
-                    }
+                    logger.LogInformation("Request preprocessing for: {ToModel} [liquid={IsLiquid}, qwen={IsQwen}]", modelRoute.ToModel, isLiquid, isQwen);
 
-                    // Inject tools and instructions into system message (Liquid format)
-                    var toolsJsonStr = System.Text.Json.JsonSerializer.Serialize(liquidToolsJson);
-                    var systemInstruction = $"\n\nAvailable tools (JSON format):\n{toolsJsonStr}\n\nWhen you need to execute commands or access tools:\n1. Use the <|tool_call_start|> and <|tool_call_end|> tokens\n2. Format as JSON: {{\"name\": \"bash\", \"arguments\": {{\"command\": \"your command here\"}}}}\n3. Example: <|tool_call_start|>{{\"name\": \"bash\", \"arguments\": {{\"command\": \"ls -la\"}}}}<|tool_call_end|>\n4. Generate ONLY the tool call, do not include markdown code blocks or explanations";
+                    // Build tools JSON for Liquid format (expected in system prompt only)
+                    List<object>? liquidToolsJson = null;
+                    string? systemInstruction = null;
 
-                    if (root.TryGetProperty("system", out var sysMsg))
+                    if (isLiquid)
                     {
-                        if (sysMsg.ValueKind == JsonValueKind.String)
+                        liquidToolsJson = new List<object>();
+                        if (root.TryGetProperty("tools", out var toolsField))
                         {
-                            var existingSys = sysMsg.GetString() ?? "";
-                            w.WriteString("system", existingSys + systemInstruction);
-                        }
-                        else if (sysMsg.ValueKind == JsonValueKind.Array)
-                        {
-                            // System is array of content blocks - convert to string and inject tools
-                            var systemTexts = new List<string>();
-                            foreach (var block in sysMsg.EnumerateArray())
+                            foreach (var tool in toolsField.EnumerateArray())
                             {
-                                if (block.TryGetProperty("text", out var textElem))
+                                if (tool.TryGetProperty("name", out var n) &&
+                                    LocalLlmToolFilter.IsAllowed(n.GetString() ?? "", modelRoute.IncludedTools, modelRoute.AllowedMcpServers))
                                 {
-                                    systemTexts.Add(textElem.GetString() ?? "");
+                                    liquidToolsJson.Add(tool);
                                 }
                             }
-                            var combinedSystem = string.Join("\n\n", systemTexts) + systemInstruction;
-                            w.WriteString("system", combinedSystem);
-                            logger.LogInformation("Converted system array to string and injected tools");
                         }
-                        else
+
+                        // Inject tools and instructions into system message (Liquid-specific format)
+                        var toolsJsonStr = System.Text.Json.JsonSerializer.Serialize(liquidToolsJson);
+                        logger.LogInformation("Tools for Liquid: {ToolCount} tools, JSON: {ToolsJson}", liquidToolsJson.Count, toolsJsonStr.Length > 500 ? toolsJsonStr[..500] + "..." : toolsJsonStr);
+                        systemInstruction = $"\n\n=== TOOLS (JSON) ===\n{toolsJsonStr}\n\n=== CRITICAL INSTRUCTION ===\nWhen you need to run commands or use tools:\n1. ALWAYS wrap your tool call in <|tool_call_start|> and <|tool_call_end|> tokens\n2. NEVER use markdown code blocks like ```bash\n3. Format the JSON exactly like this: {{\"name\": \"bash\", \"arguments\": {{\"command\": \"your full command\"}}}}\n4. Example tool call:\n<|tool_call_start|>{{\"name\": \"bash\", \"arguments\": {{\"command\": \"git status\"}}}}<|tool_call_end|>\n5. Output ONLY the tool JSON between the tokens, no additional text\n\nIf markdown code blocks appear in the response, it is an error and must be corrected by wrapping in tool tokens instead.";
+                    }
+                    else if (isQwen)
+                    {
+                        logger.LogInformation("Qwen: converting from Anthropic format to OpenAI chat format");
+                        // For Qwen, convert Anthropic Messages API to OpenAI chat format
+                        // System message becomes first message with role="system"
+                        w.WritePropertyName("messages");
+                        w.WriteStartArray();
+
+                        // Use a minimal fixed system prompt — discard CLAUDE.md and all Claude Code system blocks
+                        w.WriteStartObject();
+                        w.WriteString("role", "system");
+                        w.WriteString("content", "You are a coding assistant. You MUST use tools to complete tasks. NEVER explain or describe what you would do — always call the appropriate tool immediately. If the user asks you to run a command, call Bash. If asked to read a file, call Read. Act, don't explain.");
+                        w.WriteEndObject();
+                        logger.LogInformation("Qwen: using minimal fixed system prompt");
+
+                        // Add all messages — convert Anthropic format to OpenAI chat format
+                        if (root.TryGetProperty("messages", out var messagesField))
                         {
-                            // System is other format, pass through as-is
+                            foreach (var msg in messagesField.EnumerateArray())
+                            {
+                                var roleStr = msg.TryGetProperty("role", out var roleElem) ? roleElem.GetString() ?? "" : "";
+
+                                if (msg.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                                {
+                                    var blocks = content.EnumerateArray().ToList();
+                                    var hasToolUse = roleStr == "assistant" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_use");
+                                    var hasToolResult = roleStr == "user" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_result");
+
+                                    if (hasToolUse)
+                                    {
+                                        // Convert Anthropic tool_use → OpenAI tool_calls
+                                        w.WriteStartObject();
+                                        w.WriteString("role", "assistant");
+                                        w.WriteNull("content");
+                                        w.WritePropertyName("tool_calls");
+                                        w.WriteStartArray();
+                                        foreach (var block in blocks)
+                                        {
+                                            if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_use") continue;
+                                            var tid = block.TryGetProperty("id", out var idEl) ? idEl.GetString() : $"tool_{Guid.NewGuid():N}";
+                                            var tname = block.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : "";
+                                            var tinput = block.TryGetProperty("input", out var inputEl) ? inputEl.GetRawText() : "{}";
+                                            w.WriteStartObject();
+                                            w.WriteString("id", tid);
+                                            w.WriteString("type", "function");
+                                            w.WritePropertyName("function");
+                                            w.WriteStartObject();
+                                            w.WriteString("name", tname);
+                                            w.WriteString("arguments", tinput);
+                                            w.WriteEndObject();
+                                            w.WriteEndObject();
+                                        }
+                                        w.WriteEndArray();
+                                        w.WriteEndObject();
+                                    }
+                                    else if (hasToolResult)
+                                    {
+                                        // Convert Anthropic tool_result → OpenAI tool role messages (one per result)
+                                        foreach (var block in blocks)
+                                        {
+                                            if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_result") continue;
+                                            var callId = block.TryGetProperty("tool_use_id", out var cid) ? cid.GetString() ?? "" : "";
+                                            string resultText;
+                                            if (block.TryGetProperty("content", out var rc))
+                                                resultText = rc.ValueKind == JsonValueKind.String ? rc.GetString() ?? "" : rc.GetRawText();
+                                            else
+                                                resultText = "";
+                                            w.WriteStartObject();
+                                            w.WriteString("role", "tool");
+                                            w.WriteString("tool_call_id", callId);
+                                            w.WriteString("content", resultText);
+                                            w.WriteEndObject();
+                                        }
+                                    }
+                                    else
+                                    {
+                                        // Regular message — filter noise, keep text blocks
+                                        w.WriteStartObject();
+                                        w.WriteString("role", roleStr);
+                                        w.WritePropertyName("content");
+                                        w.WriteStartArray();
+                                        foreach (var block in blocks)
+                                        {
+                                            if (block.TryGetProperty("type", out var bType) && bType.GetString() == "text"
+                                                && block.TryGetProperty("text", out var bText))
+                                            {
+                                                var text = LocalLlmRequestFilter.StripInlineNoise(bText.GetString() ?? "");
+                                                if (!LocalLlmRequestFilter.IsMessageNoise(text) && !string.IsNullOrWhiteSpace(text))
+                                                {
+                                                    w.WriteStartObject();
+                                                    w.WriteString("type", "text");
+                                                    w.WriteString("text", text);
+                                                    w.WriteEndObject();
+                                                }
+                                            }
+                                        }
+                                        w.WriteEndArray();
+                                        w.WriteEndObject();
+                                    }
+                                }
+                                else if (msg.TryGetProperty("content", out var contentStr) && contentStr.ValueKind == JsonValueKind.String)
+                                {
+                                    w.WriteStartObject();
+                                    w.WriteString("role", roleStr);
+                                    w.WriteString("content", LocalLlmRequestFilter.StripInlineNoise(contentStr.GetString() ?? ""));
+                                    w.WriteEndObject();
+                                }
+                            }
+                        }
+
+                        w.WriteEndArray();
+
+                        // Add tools if present - convert from Anthropic to OpenAI format
+                        if (root.TryGetProperty("tools", out var toolsField) && toolsField.ValueKind == JsonValueKind.Array)
+                        {
+                            w.WritePropertyName("tools");
+                            w.WriteStartArray();
+
+                            var qwenToolCount = 0;
+                            var qwenSkippedCount = 0;
+                            foreach (var tool in toolsField.EnumerateArray())
+                            {
+                                var toolName = tool.TryGetProperty("name", out var nameCheck) ? nameCheck.GetString() ?? "" : "";
+                                if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpServers))
+                                {
+                                    qwenSkippedCount++;
+                                    continue;
+                                }
+
+                                LocalLlmRequestFilter.WriteSlimTool(w, tool);
+                                qwenToolCount++;
+                            }
+
+                            w.WriteEndArray(); // end tools array
+                            logger.LogInformation("✓ Qwen tools: {Included} included, {Skipped} skipped (IncludedTools filter + MCP filter)", qwenToolCount, qwenSkippedCount);
+                        }
+
+                        // Force tool_choice=required when tools are present — prevents Qwen from responding with text instead of calling tools
+                        var hasTools = root.TryGetProperty("tools", out var tc) && tc.ValueKind == JsonValueKind.Array && tc.GetArrayLength() > 0;
+                        w.WriteString("tool_choice", hasTools ? "required" : "none");
+
+                        // Force stream=false — Qwen2_5ResponseHandler expects plain JSON, not SSE
+                        w.WriteBoolean("stream", false);
+
+                        logger.LogInformation("✓ Converted to OpenAI chat format (stream=false)");
+                    }
+
+                    // System message handling: Liquid uses minimal fixed base + tool injection, discards CLAUDE.md
+                    if (isLiquid && !string.IsNullOrEmpty(systemInstruction))
+                    {
+                        var finalSys = "You are a helpful coding assistant." + systemInstruction;
+                        w.WriteString("system", finalSys);
+                        logger.LogInformation("Liquid: minimal system + tools injected: {SysLength} chars", finalSys.Length);
+                    }
+                    else if (!isLiquid && !isQwen)
+                    {
+                        // Default: pass through system field for unknown models
+                        if (root.TryGetProperty("system", out var sysMsg))
+                        {
                             w.WritePropertyName("system");
                             sysMsg.WriteTo(w);
                         }
                     }
-                    else
-                    {
-                        w.WriteString("system", "You are a helpful assistant with access to command-line tools." + systemInstruction);
-                    }
+                    // Qwen: no top-level system — already written as messages[0] in the Qwen block above
 
                     // Copy all other fields from original request, except unsupported ones
                     // For messages, strip system-reminder tags to reduce token overhead
@@ -315,6 +478,13 @@ try
                     {
                         if (prop.Name.Equals("messages", StringComparison.OrdinalIgnoreCase))
                         {
+                            // Skip messages for Qwen - already written in Qwen block
+                            if (isQwen)
+                            {
+                                logger.LogInformation("Qwen: Skipping messages field (already converted in Qwen block)");
+                                continue;
+                            }
+
                             // Filter out system reminders from messages to save tokens
                             w.WritePropertyName("messages");
                             w.WriteStartArray();
@@ -364,8 +534,23 @@ try
                         }
                         else if (prop.Name.Equals("tools", StringComparison.OrdinalIgnoreCase))
                         {
-                            // Tools already injected into system message for Liquid, skip the tools field
-                            logger.LogInformation("Skipping tools field (already in system prompt for Liquid)");
+                            if (isLiquid)
+                            {
+                                // Tools already injected into system message for Liquid, skip the tools field
+                                logger.LogInformation("Liquid: Skipping tools field (already in system prompt)");
+                            }
+                            else if (isQwen)
+                            {
+                                // Qwen: tools already written in Qwen block, skip
+                                logger.LogInformation("Qwen: Skipping tools field (already converted in Qwen block)");
+                            }
+                            else
+                            {
+                                // Default: keep tools
+                                logger.LogInformation("Keeping tools field");
+                                w.WritePropertyName("tools");
+                                prop.Value.WriteTo(w);
+                            }
                         }
                         else if (!fieldsToSkip.Contains(prop.Name))
                         {
@@ -386,7 +571,13 @@ try
                 var payload = ms.ToArray();
                 proxyReq.Content = new ByteArrayContent(payload);
                 proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-                logger.LogInformation("Forwarding to LM Studio /v1/messages (Anthropic format): {From} -> {To}", model, modelRoute.ToModel);
+
+                if (isQwen)
+                    logger.LogInformation("Forwarding to LM Studio /v1/chat/completions (OpenAI format): {From} -> {To}", model, modelRoute.ToModel);
+                else if (isLiquid)
+                    logger.LogInformation("Forwarding to LM Studio /v1/messages (Anthropic format): {From} -> {To}", model, modelRoute.ToModel);
+                else
+                    logger.LogInformation("Forwarding to LM Studio: {From} -> {To}", model, modelRoute.ToModel);
             }
 
             var responseBuffering = context.Features
@@ -990,6 +1181,10 @@ public class ModelRouteSettings
     public bool Enabled { get; set; } = true;
     public string FromModel { get; set; } = "Haiku";
     public string ToModel { get; set; } = "liquid/lfm2.5-1.2b";
+    /// <summary>Built-in tools to include when forwarding to local LLM. Empty = allow all non-MCP tools.</summary>
+    public List<string> IncludedTools { get; set; } = new();
+    /// <summary>MCP server names whose tools are allowed for local LLM. Empty = no MCP tools.</summary>
+    public List<string> AllowedMcpServers { get; set; } = new();
 }
 
 public class ModelRouteRequest
@@ -997,6 +1192,153 @@ public class ModelRouteRequest
     public bool? Enabled { get; set; }
     public string? FromModel { get; set; }
     public string? ToModel { get; set; }
+}
+
+/// <summary>
+/// Determines whether a tool should be forwarded to the local LLM.
+/// MCP tools (name starts with "mcp__") are allowed only if their server is in allowedMcpServers.
+/// Built-in tools are allowed only if they are in includedTools (empty list = allow all built-ins).
+/// This filter applies exclusively to the local LLM path — the Anthropic path is always pass-through.
+/// </summary>
+public static class LocalLlmToolFilter
+{
+    public static bool IsAllowed(string toolName, IList<string> includedTools, IList<string> allowedMcpServers)
+    {
+        if (toolName.StartsWith("mcp__", StringComparison.OrdinalIgnoreCase))
+        {
+            if (allowedMcpServers.Count == 0) return false;
+            // name format: mcp__<ServerName>__<toolName>
+            var parts = toolName.Split("__", 3);
+            var serverName = parts.Length >= 2 ? parts[1] : "";
+            return allowedMcpServers.Any(s => s.Equals(serverName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (includedTools.Count == 0) return true;
+        return includedTools.Any(t => t.Equals(toolName, StringComparison.OrdinalIgnoreCase));
+    }
+}
+
+/// <summary>
+/// Strips Anthropic-specific noise from requests before forwarding to local LLM.
+/// Applies only to the local LLM path — Anthropic path is always pass-through.
+/// </summary>
+public static class LocalLlmRequestFilter
+{
+    // Tags whose blocks should be dropped entirely from message content
+    private static readonly string[] NoiseTags =
+        ["system-reminder", "local-command-caveat", "command-name", "local-command-stdout", "available-deferred-tools"];
+
+    /// <summary>Returns true if a system-array text block is Anthropic infrastructure noise.</summary>
+    public static bool IsSystemNoise(string text)
+    {
+        var t = text.TrimStart();
+        return t.StartsWith("x-anthropic-billing-header:", StringComparison.OrdinalIgnoreCase)
+            || t.StartsWith("You are Claude Code, Anthropic", StringComparison.Ordinal);
+    }
+
+    /// <summary>Returns true if a message content text block is purely Anthropic metadata.</summary>
+    public static bool IsMessageNoise(string text)
+    {
+        var t = text.Trim();
+        if (string.IsNullOrEmpty(t)) return true;
+        foreach (var tag in NoiseTags)
+            if (t.StartsWith($"<{tag}>") || t.StartsWith($"<{tag} "))
+                return true;
+        return false;
+    }
+
+    /// <summary>Strips system-reminder XML tags from a text string (inline clean-up).</summary>
+    public static string StripInlineNoise(string text) =>
+        System.Text.RegularExpressions.Regex.Replace(
+            text, @"<system-reminder>.*?</system-reminder>\n*", "",
+            System.Text.RegularExpressions.RegexOptions.Singleline).Trim();
+
+    /// <summary>
+    /// Strips mermaid diagrams and the Changelog section from CLAUDE.md-style system content.
+    /// Keeps Non-Negotiables, Key Behaviors, API Endpoints, and other task-relevant sections.
+    /// </summary>
+    public static string TrimSystemContent(string text)
+    {
+        // Remove mermaid diagrams (visual, no value as text)
+        text = System.Text.RegularExpressions.Regex.Replace(
+            text, @"```mermaid.*?```", "", System.Text.RegularExpressions.RegexOptions.Singleline);
+        // Remove Changelog section to end (it's always last and never useful for task execution)
+        var changelogIdx = text.IndexOf("\n## Changelog", StringComparison.Ordinal);
+        if (changelogIdx > 0) text = text[..changelogIdx];
+        return text.Trim();
+    }
+
+    /// <summary>
+    /// Writes a slim OpenAI-format tool definition from an Anthropic-format tool element.
+    /// Strips verbose descriptions and optional parameter details to reduce token overhead.
+    /// </summary>
+    public static void WriteSlimTool(System.Text.Json.Utf8JsonWriter w, JsonElement anthropicTool)
+    {
+        w.WriteStartObject();
+        w.WriteString("type", "function");
+        w.WritePropertyName("function");
+        w.WriteStartObject();
+
+        if (anthropicTool.TryGetProperty("name", out var name))
+            { w.WritePropertyName("name"); name.WriteTo(w); }
+
+        // Truncate description to first line, max 120 chars
+        if (anthropicTool.TryGetProperty("description", out var desc))
+        {
+            var d = desc.GetString() ?? "";
+            var nl = d.IndexOf('\n');
+            if (nl > 0) d = d[..nl].Trim();
+            if (d.Length > 120) { var dot = d.IndexOf(". "); d = dot > 0 ? d[..(dot + 1)] : d[..120]; }
+            w.WriteString("description", d);
+        }
+
+        if (anthropicTool.TryGetProperty("input_schema", out var schema))
+        {
+            w.WritePropertyName("parameters");
+            WriteSlimSchema(w, schema);
+        }
+
+        w.WriteEndObject(); // function
+        w.WriteEndObject(); // tool
+    }
+
+    private static void WriteSlimSchema(System.Text.Json.Utf8JsonWriter w, JsonElement schema)
+    {
+        var required = new HashSet<string>(StringComparer.Ordinal);
+        JsonElement reqElem = default;
+        if (schema.TryGetProperty("required", out reqElem) && reqElem.ValueKind == JsonValueKind.Array)
+            foreach (var r in reqElem.EnumerateArray())
+                if (r.GetString() is string s) required.Add(s);
+
+        w.WriteStartObject();
+        w.WriteString("type", "object");
+
+        if (schema.TryGetProperty("properties", out var props))
+        {
+            w.WritePropertyName("properties");
+            w.WriteStartObject();
+            foreach (var prop in props.EnumerateObject())
+            {
+                w.WritePropertyName(prop.Name);
+                w.WriteStartObject();
+                if (prop.Value.TryGetProperty("type", out var t)) { w.WritePropertyName("type"); t.WriteTo(w); }
+                if (prop.Value.TryGetProperty("enum", out var e)) { w.WritePropertyName("enum"); e.WriteTo(w); }
+                // Description only for required params, truncated to 80 chars
+                if (required.Contains(prop.Name) && prop.Value.TryGetProperty("description", out var d))
+                {
+                    var dt = d.GetString() ?? "";
+                    var nl = dt.IndexOf('\n'); if (nl > 0) dt = dt[..nl].Trim();
+                    if (dt.Length > 80) dt = dt[..80];
+                    w.WriteString("description", dt);
+                }
+                w.WriteEndObject();
+            }
+            w.WriteEndObject();
+        }
+
+        if (reqElem.ValueKind == JsonValueKind.Array) { w.WritePropertyName("required"); reqElem.WriteTo(w); }
+        w.WriteEndObject();
+    }
 }
 
 // Tool translator: converts Liquid format tool calls to Anthropic format

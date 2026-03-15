@@ -65,10 +65,21 @@ podman-compose logs -f
 podman-compose down
 ```
 
-Rebuild from scratch (when cached layers hide code changes):
+**Full rebuild** (use this when code changes aren't being picked up):
 
 ```bash
-podman-compose down && podman-compose build --no-cache && podman-compose up -d
+podman-compose down \
+  && podman rmi macau-v1_claude-proxy --force 2>/dev/null; \
+  podman-compose build --no-cache \
+  && podman-compose up -d
+```
+
+> `--no-cache` alone isn't enough — `podman-compose up` will reuse the existing tagged image even after a rebuild. Explicitly removing the image forces Podman to use the freshly built one.
+
+Check which image name Podman is using if the above fails:
+
+```bash
+podman images | grep claude-proxy
 ```
 
 ### Podman

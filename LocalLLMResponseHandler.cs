@@ -143,10 +143,56 @@ public class LiquidResponseHandler : ILocalLLMResponseHandler
                             }
                             else
                             {
-                                // No tool calls found, send as text
-                                var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
-                                await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
-                                await context.Response.Body.FlushAsync();
+                                // No Liquid tool calls - try to extract bash code blocks from markdown
+                                logger.LogInformation("No Liquid tool tokens found, checking for markdown bash blocks");
+                                var bashCodeRegex = new System.Text.RegularExpressions.Regex(@"```bash\n(.*?)\n```", System.Text.RegularExpressions.RegexOptions.Singleline);
+                                var bashMatch = bashCodeRegex.Match(textContent);
+
+                                if (bashMatch.Success)
+                                {
+                                    var bashCode = bashMatch.Groups[1].Value.Trim();
+                                    logger.LogInformation("✓ Extracted bash code block: {Code}", bashCode.Length > 200 ? bashCode[..200] + "..." : bashCode);
+
+                                    // Convert bash code to tool_use block
+                                    try
+                                    {
+                                        using var ms = new MemoryStream();
+                                        using (var w = new System.Text.Json.Utf8JsonWriter(ms))
+                                        {
+                                            w.WriteStartObject();
+                                            w.WriteString("type", "tool_use");
+                                            w.WriteString("id", $"toolu_{Guid.NewGuid():N}");
+                                            w.WriteString("name", "Bash");
+                                            w.WritePropertyName("input");
+                                            w.WriteStartObject();
+                                            w.WriteString("command", bashCode);
+                                            w.WriteEndObject();
+                                            w.WriteEndObject();
+                                        }
+
+                                        var toolUseJson = System.Text.Json.JsonDocument.Parse(ms.ToArray()).RootElement;
+                                        var escaped = System.Text.Json.JsonSerializer.Serialize(toolUseJson)[1..^1];
+                                        logger.LogInformation("✓ Converted to tool_use block, sending to Claude Code");
+                                        await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"tool_use\",\"json\":\"{escaped}\"}}}}\n\n");
+                                        await context.Response.Body.FlushAsync();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        logger.LogError(ex, "✗ Failed to convert bash block to tool_use");
+                                        // Fall back to text
+                                        var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
+                                        await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                                        await context.Response.Body.FlushAsync();
+                                    }
+                                }
+                                else
+                                {
+                                    // No bash blocks either - send as plain text
+                                    logger.LogInformation("No bash code blocks found, sending as text");
+                                    var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
+                                    await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
+                                    await context.Response.Body.FlushAsync();
+                                }
                             }
                         }
                         else if (blockType == "tool_use")
@@ -215,10 +261,13 @@ public class LiquidResponseHandler : ILocalLLMResponseHandler
             var data = line["data: ".Length..];
             if (data == "[DONE]")
             {
+                logger.LogInformation("SSE stream end marker received. Buffer size: {BufferSize} chars", textBuffer.Length);
+
                 // Flush any remaining buffered text before finishing
                 if (textBuffer.Length > 0)
                 {
                     var fullText = textBuffer.ToString();
+                    logger.LogInformation("Processing buffered text, checking for bash blocks");
 
                     // Try to extract bash code blocks and convert to tool calls
                     var bashCodeRegex = new System.Text.RegularExpressions.Regex(@"```bash\n(.*?)\n```", System.Text.RegularExpressions.RegexOptions.Singleline);
@@ -226,7 +275,7 @@ public class LiquidResponseHandler : ILocalLLMResponseHandler
                     if (match.Success)
                     {
                         var bashCode = match.Groups[1].Value.Trim();
-                        logger.LogInformation("Extracted bash code from buffered text: {Code}", bashCode);
+                        logger.LogInformation("✓ Extracted bash code from SSE stream: {Code}", bashCode.Length > 200 ? bashCode[..200] + "..." : bashCode);
 
                         // Convert bash code to tool_use block
                         using var ms = new MemoryStream();
@@ -251,10 +300,15 @@ public class LiquidResponseHandler : ILocalLLMResponseHandler
                     else
                     {
                         // No bash code block, send as text
+                        logger.LogInformation("No bash blocks found in SSE stream, sending as text");
                         var escaped = System.Text.Json.JsonSerializer.Serialize(fullText)[1..^1];
                         await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
                         await context.Response.Body.FlushAsync();
                     }
+                }
+                else
+                {
+                    logger.LogInformation("SSE stream ended with empty buffer");
                 }
 
                 logger.LogInformation("LM Studio stream completed: {ChunkCount} chunks translated", chunkCount);
