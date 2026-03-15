@@ -72,14 +72,7 @@ try
     builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<ILiteDatabase>(_ => new LiteDatabase(dbPath));
 
-    // Register tool mapper (singleton - loads translation table once at startup)
-    builder.Services.AddSingleton<LiquidToolMapper>();
-
     // Register local LLM response handlers with keyed DI (open-closed principle)
-    builder.Services.AddKeyedScoped<ILocalLLMResponseHandler>(
-        "liquid/lfm2.5-1.2b",
-        (sp, key) => new LiquidResponseHandler(sp.GetRequiredService<LiquidToolMapper>()));
-
     builder.Services.AddKeyedScoped<ILocalLLMResponseHandler>(
         "qwen/qwen2.5-coder-14b",
         (sp, key) => new Qwen2_5ResponseHandler());
@@ -100,7 +93,7 @@ try
     {
         Enabled = localLlmConfig.GetValue("Enabled", true),
         FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
-        ToModel = localLlmConfig.GetValue("ToModel", "liquid/lfm2.5-1.2b")!,
+        ToModel = localLlmConfig.GetValue("ToModel", "qwen/qwen2.5-coder-14b")!,
         IncludedTools = localLlmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
         AllowedMcpServers = localLlmConfig.GetSection("AllowedMcpServers").Get<List<string>>() ?? new()
     };
@@ -179,8 +172,6 @@ try
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
             req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
 
-        // Determine target model type early for endpoint selection
-        var isLiquid = modelRoute.ToModel.Equals("liquid/lfm2.5-1.2b", StringComparison.OrdinalIgnoreCase);
         var isQwen = modelRoute.ToModel.Contains("qwen", StringComparison.OrdinalIgnoreCase);
 
         // Route matching models to local LLM via LM Studio
@@ -190,15 +181,12 @@ try
             using var httpClient = httpFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(10);
 
-            // Choose endpoint based on model: Qwen uses OpenAI-compatible chat, Liquid uses Anthropic messages
-            var targetUrl = isQwen
-                ? $"{localLlmUrl.TrimEnd('/')}/v1/chat/completions"
-                : $"{localLlmUrl.TrimEnd('/')}/v1/messages";
+            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/v1/chat/completions";
             logger.LogInformation("Target endpoint: {Endpoint}", targetUrl.Split('/').Last());
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
             proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {localLlmToken}");
 
-            // Forward Anthropic Messages request directly (no conversion needed)
+            // Convert and forward request to local LLM
             if (req.ContentLength > 0 || req.ContentType is not null)
             {
                 req.Body.Position = 0;
@@ -223,24 +211,19 @@ try
                         toolsJson.Length, tools.GetArrayLength());
                 }
 
-                // Rewrite model field and filter out unsupported fields for Liquid
-                // metadata and context_management are Anthropic-specific and cause context bloat
-                // tools ARE sent to Liquid so it can generate tool_use blocks (hybrid approach)
-                // Also remove cache_control from nested content blocks (Anthropic-specific)
+                // Rewrite model field and filter out Anthropic-specific fields unsupported by local models
+                // metadata and context_management cause context bloat; cache_control is Anthropic-only
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "model", "budget_tokens", "thinking", "metadata", "context_management" };
 
                 // For Qwen: skip tool_choice, system, and stream — all handled explicitly
                 // stream must be false for Qwen: Qwen2_5ResponseHandler expects plain JSON, not SSE
-                // For Liquid: skip system — already written with tool injection
                 if (isQwen)
                 {
                     fieldsToSkip.Add("tool_choice");
                     fieldsToSkip.Add("system");
                     fieldsToSkip.Add("stream");
                 }
-                if (isLiquid)
-                    fieldsToSkip.Add("system");
                 var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "cache_control" };
 
@@ -279,33 +262,9 @@ try
                     w.WriteStartObject();
                     w.WriteString("model", modelRoute.ToModel);
 
-                    logger.LogInformation("Request preprocessing for: {ToModel} [liquid={IsLiquid}, qwen={IsQwen}]", modelRoute.ToModel, isLiquid, isQwen);
+                    logger.LogInformation("Request preprocessing for Qwen: {ToModel}", modelRoute.ToModel);
 
-                    // Build tools JSON for Liquid format (expected in system prompt only)
-                    List<object>? liquidToolsJson = null;
-                    string? systemInstruction = null;
-
-                    if (isLiquid)
-                    {
-                        liquidToolsJson = new List<object>();
-                        if (root.TryGetProperty("tools", out var toolsField))
-                        {
-                            foreach (var tool in toolsField.EnumerateArray())
-                            {
-                                if (tool.TryGetProperty("name", out var n) &&
-                                    LocalLlmToolFilter.IsAllowed(n.GetString() ?? "", modelRoute.IncludedTools, modelRoute.AllowedMcpServers))
-                                {
-                                    liquidToolsJson.Add(tool);
-                                }
-                            }
-                        }
-
-                        // Inject tools and instructions into system message (Liquid-specific format)
-                        var toolsJsonStr = System.Text.Json.JsonSerializer.Serialize(liquidToolsJson);
-                        logger.LogInformation("Tools for Liquid: {ToolCount} tools, JSON: {ToolsJson}", liquidToolsJson.Count, toolsJsonStr.Length > 500 ? toolsJsonStr[..500] + "..." : toolsJsonStr);
-                        systemInstruction = $"\n\n=== TOOLS (JSON) ===\n{toolsJsonStr}\n\n=== CRITICAL INSTRUCTION ===\nWhen you need to run commands or use tools:\n1. ALWAYS wrap your tool call in <|tool_call_start|> and <|tool_call_end|> tokens\n2. NEVER use markdown code blocks like ```bash\n3. Format the JSON exactly like this: {{\"name\": \"bash\", \"arguments\": {{\"command\": \"your full command\"}}}}\n4. Example tool call:\n<|tool_call_start|>{{\"name\": \"bash\", \"arguments\": {{\"command\": \"git status\"}}}}<|tool_call_end|>\n5. Output ONLY the tool JSON between the tokens, no additional text\n\nIf markdown code blocks appear in the response, it is an error and must be corrected by wrapping in tool tokens instead.";
-                    }
-                    else if (isQwen)
+                    if (isQwen)
                     {
                         logger.LogInformation("Qwen: converting from Anthropic format to OpenAI chat format");
                         // For Qwen, convert Anthropic Messages API to OpenAI chat format
@@ -452,23 +411,16 @@ try
                         logger.LogInformation("✓ Converted to OpenAI chat format (stream=false)");
                     }
 
-                    // System message handling: Liquid uses minimal fixed base + tool injection, discards CLAUDE.md
-                    if (isLiquid && !string.IsNullOrEmpty(systemInstruction))
+                    // Qwen: no top-level system — already written as messages[0] in the Qwen block above
+                    // Default (unknown models): pass through system field
+                    if (!isQwen)
                     {
-                        var finalSys = "You are a helpful coding assistant." + systemInstruction;
-                        w.WriteString("system", finalSys);
-                        logger.LogInformation("Liquid: minimal system + tools injected: {SysLength} chars", finalSys.Length);
-                    }
-                    else if (!isLiquid && !isQwen)
-                    {
-                        // Default: pass through system field for unknown models
                         if (root.TryGetProperty("system", out var sysMsg))
                         {
                             w.WritePropertyName("system");
                             sysMsg.WriteTo(w);
                         }
                     }
-                    // Qwen: no top-level system — already written as messages[0] in the Qwen block above
 
                     // Copy all other fields from original request, except unsupported ones
                     // For messages, strip system-reminder tags to reduce token overhead
@@ -534,20 +486,13 @@ try
                         }
                         else if (prop.Name.Equals("tools", StringComparison.OrdinalIgnoreCase))
                         {
-                            if (isLiquid)
-                            {
-                                // Tools already injected into system message for Liquid, skip the tools field
-                                logger.LogInformation("Liquid: Skipping tools field (already in system prompt)");
-                            }
-                            else if (isQwen)
+                            if (isQwen)
                             {
                                 // Qwen: tools already written in Qwen block, skip
-                                logger.LogInformation("Qwen: Skipping tools field (already converted in Qwen block)");
                             }
                             else
                             {
                                 // Default: keep tools
-                                logger.LogInformation("Keeping tools field");
                                 w.WritePropertyName("tools");
                                 prop.Value.WriteTo(w);
                             }
@@ -565,19 +510,14 @@ try
                     w.WriteEndObject();
 
                     if (filteredFields.Count > 0)
-                        logger.LogInformation("Filtered out unsupported fields for Liquid: {Fields}", string.Join(", ", filteredFields));
+                        logger.LogInformation("Filtered out unsupported fields: {Fields}", string.Join(", ", filteredFields));
                 }
 
                 var payload = ms.ToArray();
                 proxyReq.Content = new ByteArrayContent(payload);
                 proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
-                if (isQwen)
-                    logger.LogInformation("Forwarding to LM Studio /v1/chat/completions (OpenAI format): {From} -> {To}", model, modelRoute.ToModel);
-                else if (isLiquid)
-                    logger.LogInformation("Forwarding to LM Studio /v1/messages (Anthropic format): {From} -> {To}", model, modelRoute.ToModel);
-                else
-                    logger.LogInformation("Forwarding to LM Studio: {From} -> {To}", model, modelRoute.ToModel);
+                logger.LogInformation("Forwarding to LM Studio /v1/chat/completions: {From} -> {To}", model, modelRoute.ToModel);
             }
 
             var responseBuffering = context.Features
@@ -947,7 +887,7 @@ try
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
         cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "liquid/lfm2.5-1.2b" });
+        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "qwen/qwen2.5-coder-14b" });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
@@ -1207,10 +1147,8 @@ public static class LocalLlmToolFilter
         if (toolName.StartsWith("mcp__", StringComparison.OrdinalIgnoreCase))
         {
             if (allowedMcpServers.Count == 0) return false;
-            // name format: mcp__<ServerName>__<toolName>
-            var parts = toolName.Split("__", 3);
-            var serverName = parts.Length >= 2 ? parts[1] : "";
-            return allowedMcpServers.Any(s => s.Equals(serverName, StringComparison.OrdinalIgnoreCase));
+            // Each entry is a case-insensitive prefix: "mcp__conductor" allows all conductor tools
+            return allowedMcpServers.Any(s => toolName.StartsWith(s, StringComparison.OrdinalIgnoreCase));
         }
 
         if (includedTools.Count == 0) return true;
