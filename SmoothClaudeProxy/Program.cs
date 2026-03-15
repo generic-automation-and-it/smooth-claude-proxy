@@ -207,6 +207,25 @@ try
         // Route matching models to local LLM via LM Studio
         if (isLmStudioRoute)
         {
+            // LM Studio does not support the count_tokens endpoint — intercept it and
+            // return an estimate so Claude Code can manage its own context window.
+            // Without this, Claude Code gets a 400, can't track context size, and
+            // eventually sends an oversized request that Qwen silently truncates,
+            // causing the model to lose conversation history and loop on the same commands.
+            if (req.Path.Value?.EndsWith("count_tokens", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                req.EnableBuffering();
+                req.Body.Position = 0;
+                using var ctReader = new StreamReader(req.Body, leaveOpen: true);
+                var ctBody = await ctReader.ReadToEndAsync();
+                var estimatedTokens = Math.Max(1000, ctBody.Length / 4);
+                logger.LogInformation("count_tokens intercepted for LM Studio route — estimated {Tokens} tokens from {Bytes} bytes", estimatedTokens, ctBody.Length);
+                context.Response.StatusCode = 200;
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync($"{{\"input_tokens\":{estimatedTokens}}}");
+                return;
+            }
+
             var httpFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
             using var httpClient = httpFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(10);
@@ -588,10 +607,23 @@ try
                 if (!lmResp.IsSuccessStatusCode)
                 {
                     var errorBody = await lmResp.Content.ReadAsStringAsync();
-                    logger.LogWarning("<- {StatusCode} from local LLM: {Error}", (int)lmResp.StatusCode, errorBody);
-                    context.Response.StatusCode = (int)lmResp.StatusCode;
-                    context.Response.ContentType = "application/json";
-                    await context.Response.WriteAsync(errorBody);
+                    var isContextOverflow = errorBody.Contains("context length", StringComparison.OrdinalIgnoreCase)
+                                        || errorBody.Contains("context window", StringComparison.OrdinalIgnoreCase)
+                                        || errorBody.Contains("initial prompt", StringComparison.OrdinalIgnoreCase);
+                    if (isContextOverflow)
+                    {
+                        logger.LogWarning("LM Studio context overflow — conversation too long for {Model}. Run /compact in Claude Code to reduce context, or increase the model context length in LM Studio.", modelRoute.ToModel);
+                        context.Response.StatusCode = 400;
+                        context.Response.ContentType = "application/json";
+                        await context.Response.WriteAsync("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Context too long for local model. Run /compact in Claude Code to reduce context, or load the model with a larger context window in LM Studio.\"}}");
+                    }
+                    else
+                    {
+                        logger.LogWarning("<- {StatusCode} from local LLM: {Error}", (int)lmResp.StatusCode, errorBody);
+                        context.Response.StatusCode = (int)lmResp.StatusCode;
+                        context.Response.ContentType = "application/json";
+                        await context.Response.WriteAsync(errorBody);
+                    }
                     return;
                 }
 
