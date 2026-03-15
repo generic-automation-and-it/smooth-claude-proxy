@@ -17,6 +17,7 @@ var workspace = Environment.GetEnvironmentVariable("WORKSPACE_PATH") ?? "/data";
 var dbPath = Path.Combine(workspace, "claude-auth.db");
 var logPath = Path.Combine(workspace, "logs", "claude-proxy-.log");
 var localLlmLogPath = Path.Combine(workspace, "logs", "local-llm-service-.log");
+var toolsLogPath = Path.Combine(workspace, "logs", "tools-log.log"); // Non-rolling tools log
 var localLlmUrl = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"); // env var overrides appsettings
 var localLlmToken = Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"); // env var overrides appsettings
 
@@ -35,6 +36,18 @@ Log.Logger = new LoggerConfiguration()
             localLlmLogPath,
             rollingInterval: RollingInterval.Day,
             retainedFileCountLimit: 7)))
+    .WriteTo.Logger(lc => lc
+        .MinimumLevel.Information()
+        .Filter.ByIncludingOnly(le =>
+            le.MessageTemplate?.Text?.Contains("tool", StringComparison.OrdinalIgnoreCase) == true &&
+            (le.Level >= Serilog.Events.LogEventLevel.Warning ||
+             le.MessageTemplate?.Text?.Contains("unsupported", StringComparison.OrdinalIgnoreCase) == true ||
+             le.MessageTemplate?.Text?.Contains("not found", StringComparison.OrdinalIgnoreCase) == true ||
+             le.MessageTemplate?.Text?.Contains("Failed", StringComparison.OrdinalIgnoreCase) == true))
+        .WriteTo.File(
+            toolsLogPath,
+            rollingInterval: RollingInterval.Infinite, // No rolling
+            retainedFileCountLimit: null)) // Keep all
     .CreateLogger();
 
 try
@@ -58,6 +71,14 @@ try
     builder.Services.AddHttpClient();
     builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<ILiteDatabase>(_ => new LiteDatabase(dbPath));
+
+    // Register tool mapper (singleton - loads translation table once at startup)
+    builder.Services.AddSingleton<LiquidToolMapper>();
+
+    // Register local LLM response handlers with keyed DI (open-closed principle)
+    builder.Services.AddKeyedScoped<ILocalLLMResponseHandler>(
+        "liquid/lfm2.5-1.2b",
+        (sp, key) => new LiquidResponseHandler(sp.GetRequiredService<LiquidToolMapper>()));
 
     var upsertChannel = Channel.CreateUnbounded<UserRecord>(
         new UnboundedChannelOptions { SingleReader = true });
@@ -190,10 +211,11 @@ try
                 }
 
                 // Rewrite model field and filter out unsupported fields for Liquid
-                // tools, metadata, and context_management are Anthropic-specific and cause context bloat
+                // metadata and context_management are Anthropic-specific and cause context bloat
+                // tools ARE sent to Liquid so it can generate tool_use blocks (hybrid approach)
                 // Also remove cache_control from nested content blocks (Anthropic-specific)
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    { "model", "budget_tokens", "thinking", "tools", "metadata", "context_management" };
+                    { "model", "budget_tokens", "thinking", "metadata", "context_management" };
                 var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "cache_control" };
 
@@ -232,11 +254,120 @@ try
                     w.WriteStartObject();
                     w.WriteString("model", modelRoute.ToModel);
 
+                    // Build tools JSON for Liquid format (expected in system prompt)
+                    var liquidToolsJson = new List<object>();
+                    if (root.TryGetProperty("tools", out var toolsField))
+                    {
+                        var liquidTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                            { "bash", "read", "write", "edit", "glob", "grep" };
+                        foreach (var tool in toolsField.EnumerateArray())
+                        {
+                            if (tool.TryGetProperty("name", out var n) && liquidTools.Contains(n.GetString() ?? ""))
+                            {
+                                liquidToolsJson.Add(tool);
+                            }
+                        }
+                    }
+
+                    // Inject tools and instructions into system message (Liquid format)
+                    var toolsJsonStr = System.Text.Json.JsonSerializer.Serialize(liquidToolsJson);
+                    var systemInstruction = $"\n\nAvailable tools (JSON format):\n{toolsJsonStr}\n\nWhen you need to execute commands or access tools:\n1. Use the <|tool_call_start|> and <|tool_call_end|> tokens\n2. Format as JSON: {{\"name\": \"bash\", \"arguments\": {{\"command\": \"your command here\"}}}}\n3. Example: <|tool_call_start|>{{\"name\": \"bash\", \"arguments\": {{\"command\": \"ls -la\"}}}}<|tool_call_end|>\n4. Generate ONLY the tool call, do not include markdown code blocks or explanations";
+
+                    if (root.TryGetProperty("system", out var sysMsg))
+                    {
+                        if (sysMsg.ValueKind == JsonValueKind.String)
+                        {
+                            var existingSys = sysMsg.GetString() ?? "";
+                            w.WriteString("system", existingSys + systemInstruction);
+                        }
+                        else if (sysMsg.ValueKind == JsonValueKind.Array)
+                        {
+                            // System is array of content blocks - convert to string and inject tools
+                            var systemTexts = new List<string>();
+                            foreach (var block in sysMsg.EnumerateArray())
+                            {
+                                if (block.TryGetProperty("text", out var textElem))
+                                {
+                                    systemTexts.Add(textElem.GetString() ?? "");
+                                }
+                            }
+                            var combinedSystem = string.Join("\n\n", systemTexts) + systemInstruction;
+                            w.WriteString("system", combinedSystem);
+                            logger.LogInformation("Converted system array to string and injected tools");
+                        }
+                        else
+                        {
+                            // System is other format, pass through as-is
+                            w.WritePropertyName("system");
+                            sysMsg.WriteTo(w);
+                        }
+                    }
+                    else
+                    {
+                        w.WriteString("system", "You are a helpful assistant with access to command-line tools." + systemInstruction);
+                    }
+
                     // Copy all other fields from original request, except unsupported ones
+                    // For messages, strip system-reminder tags to reduce token overhead
+                    // For tools, simplify to basic format (name, description, parameters only)
                     var filteredFields = new List<string>();
                     foreach (var prop in root.EnumerateObject())
                     {
-                        if (!fieldsToSkip.Contains(prop.Name))
+                        if (prop.Name.Equals("messages", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Filter out system reminders from messages to save tokens
+                            w.WritePropertyName("messages");
+                            w.WriteStartArray();
+                            foreach (var msg in prop.Value.EnumerateArray())
+                            {
+                                w.WriteStartObject();
+                                if (msg.TryGetProperty("role", out var role)) { w.WritePropertyName("role"); role.WriteTo(w); }
+                                if (msg.TryGetProperty("content", out var content))
+                                {
+                                    w.WritePropertyName("content");
+                                    if (content.ValueKind == JsonValueKind.String)
+                                    {
+                                        var text = content.GetString() ?? "";
+                                        // Strip system reminders
+                                        text = System.Text.RegularExpressions.Regex.Replace(text, @"<system-reminder>.*?</system-reminder>\n*", "", System.Text.RegularExpressions.RegexOptions.Singleline);
+                                        w.WriteStringValue(text);
+                                    }
+                                    else if (content.ValueKind == JsonValueKind.Array)
+                                    {
+                                        // Content is array of blocks, filter out system-reminder text blocks
+                                        w.WriteStartArray();
+                                        foreach (var block in content.EnumerateArray())
+                                        {
+                                            if (block.TryGetProperty("type", out var type) && type.GetString() == "text" && block.TryGetProperty("text", out var txt))
+                                            {
+                                                var text = txt.GetString() ?? "";
+                                                if (!text.Contains("<system-reminder>"))
+                                                {
+                                                    block.WriteTo(w);
+                                                }
+                                            }
+                                            else
+                                            {
+                                                block.WriteTo(w);
+                                            }
+                                        }
+                                        w.WriteEndArray();
+                                    }
+                                    else
+                                    {
+                                        content.WriteTo(w);
+                                    }
+                                }
+                                w.WriteEndObject();
+                            }
+                            w.WriteEndArray();
+                        }
+                        else if (prop.Name.Equals("tools", StringComparison.OrdinalIgnoreCase))
+                        {
+                            // Tools already injected into system message for Liquid, skip the tools field
+                            logger.LogInformation("Skipping tools field (already in system prompt for Liquid)");
+                        }
+                        else if (!fieldsToSkip.Contains(prop.Name))
                         {
                             w.WritePropertyName(prop.Name);
                             WriteElementWithoutNested(w, prop.Value);
@@ -284,219 +415,9 @@ try
 
                 logger.LogInformation("Starting response handling");
 
-                // Translate LM Studio SSE stream → Anthropic SSE stream
-                var msgId = $"msg_{Guid.NewGuid():N}";
-                context.Response.StatusCode = 200;
-                context.Response.ContentType = "text/event-stream; charset=utf-8";
-
-                logger.LogInformation("Setting up SSE response with message ID: {MsgId}", msgId);
-
-                // Anthropic message_start envelope
-                var startEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{msgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"{modelRoute.ToModel}\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
-                logger.LogInformation("Writing SSE start event, length: {Length}", startEvent.Length);
-                await context.Response.WriteAsync(startEvent);
-                await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
-                await context.Response.Body.FlushAsync();
-
-                await using var stream = await lmResp.Content.ReadAsStreamAsync();
-                using var reader = new StreamReader(stream);
-
-                // Check if response is SSE or plain JSON
-                var firstLine = await reader.ReadLineAsync();
-                var isSSE = firstLine?.StartsWith("event:") == true || firstLine?.StartsWith("data:") == true;
-
-                logger.LogInformation("Response format: {Format}", isSSE ? "SSE" : "JSON");
-
-                if (!isSSE && firstLine is not null)
-                {
-                    logger.LogInformation("Handling JSON response (non-streaming)");
-                    // Handle plain JSON response (non-streaming)
-                    var fullResponse = firstLine;
-                    string? jsonLine;
-                    while ((jsonLine = await reader.ReadLineAsync()) is not null)
-                        fullResponse += jsonLine;
-
-                    logger.LogInformation("JSON response body size: {Bytes}", fullResponse.Length);
-
-                    using var doc = JsonDocument.Parse(fullResponse);
-                    var root = doc.RootElement;
-
-                    context.Response.StatusCode = 200;
-                    context.Response.ContentType = "text/event-stream; charset=utf-8";
-                    var jsonMsgId = $"msg_{Guid.NewGuid():N}";
-
-                    // Write start event
-                    var jsonStartEvent = $"event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{jsonMsgId}\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":0,\"output_tokens\":0}}}}}}\n\n";
-                    await context.Response.WriteAsync(jsonStartEvent);
-                    await context.Response.WriteAsync("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n");
-                    await context.Response.Body.FlushAsync();
-
-                    // Extract text from response
-                    var textCount = 0;
-                    if (root.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
-                    {
-                        foreach (var block in content.EnumerateArray())
-                        {
-                            if (block.TryGetProperty("type", out var type) && type.GetString() == "text"
-                                && block.TryGetProperty("text", out var text))
-                            {
-                                var textContent = text.GetString() ?? "";
-                                textCount++;
-                                logger.LogInformation("Extracted text block #{Count}, length: {Length}", textCount, textContent.Length);
-                                var escaped = System.Text.Json.JsonSerializer.Serialize(textContent)[1..^1];
-                                await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
-                                await context.Response.Body.FlushAsync();
-                            }
-                        }
-                    }
-
-                    logger.LogInformation("JSON response processed: {TextBlocks} text blocks sent");
-                    await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
-                    await context.Response.WriteAsync("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n");
-                    await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-                    await context.Response.Body.FlushAsync();
-                    logger.LogInformation("JSON response fully sent to client");
-                    return;
-                }
-
-                // Handle SSE response
-                string? line;
-                var chunkCount = 0;
-                var textBuffer = new StringBuilder();
-                var inToolCall = false;
-                var toolCallBuffer = new StringBuilder();
-
-                // Process first line if it exists
-                if (firstLine is not null && firstLine.StartsWith("data: "))
-                {
-                    var data = firstLine["data: ".Length..];
-                    if (data != "[DONE]")
-                    {
-                        // Process the first line
-                        try
-                        {
-                            using var chunk = JsonDocument.Parse(data);
-                            if (chunk.RootElement.TryGetProperty("type", out var typeElem)
-                                && typeElem.GetString() == "text_chunk"
-                                && chunk.RootElement.TryGetProperty("data", out var textElem))
-                            {
-                                var text = textElem.GetString() ?? "";
-                                textBuffer.Append(text);
-                                chunkCount++;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-
-                while ((line = await reader.ReadLineAsync()) is not null)
-                {
-                    if (!line.StartsWith("data: ")) continue;
-
-                    var data = line["data: ".Length..];
-                    if (data == "[DONE]")
-                    {
-                        // Flush any remaining buffered text before finishing
-                        if (textBuffer.Length > 0)
-                        {
-                            var escaped = System.Text.Json.JsonSerializer.Serialize(textBuffer.ToString())[1..^1];
-                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
-                            await context.Response.Body.FlushAsync();
-                        }
-
-                        logger.LogInformation("LM Studio stream completed: {ChunkCount} chunks translated", chunkCount);
-                        await context.Response.WriteAsync("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
-                        await context.Response.WriteAsync($"event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":0}}}}\n\n");
-                        await context.Response.WriteAsync("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
-                        await context.Response.Body.FlushAsync();
-                        break;
-                    }
-
-                    try
-                    {
-                        using var chunk = JsonDocument.Parse(data);
-                        // LM Studio streaming format: {index: 0, type: "text_chunk", data: "..."}
-                        if (chunk.RootElement.TryGetProperty("type", out var typeElem)
-                            && typeElem.GetString() == "text_chunk"
-                            && chunk.RootElement.TryGetProperty("data", out var textElem))
-                        {
-                            var text = textElem.GetString() ?? "";
-
-                            // Handle tool call detection
-                            while (text.Length > 0)
-                            {
-                                if (inToolCall)
-                                {
-                                    // Look for end of tool call
-                                    var endIdx = text.IndexOf("<|tool_call_end|>");
-                                    if (endIdx >= 0)
-                                    {
-                                        logger.LogInformation("⚙️ Detected tool call end token");
-                                        toolCallBuffer.Append(text[..endIdx]);
-                                        inToolCall = false;
-
-                                        // Try to parse and convert the tool call
-                                        var rawToolCall = toolCallBuffer.ToString();
-                                        logger.LogInformation("Raw Liquid tool call: {RawCall}", rawToolCall);
-
-                                        var toolUseJson = LiquidToolTranslator.TryParseAndConvertToolCall(rawToolCall);
-                                        if (toolUseJson is not null)
-                                        {
-                                            logger.LogInformation("✓ Successfully converted Liquid tool: {RawCall} → {AnthrcopicFormat}", rawToolCall, toolUseJson);
-                                            // Output tool_use block
-                                            var escaped = System.Text.Json.JsonSerializer.Serialize(toolUseJson)[1..^1];
-                                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"tool_use\",\"json\":\"{escaped}\"}}}}\n\n");
-                                            await context.Response.Body.FlushAsync();
-                                        }
-                                        else
-                                        {
-                                            logger.LogWarning("✗ Failed to convert Liquid tool call: {RawCall} (unsupported tool or parse error)", rawToolCall);
-                                        }
-
-                                        toolCallBuffer.Clear();
-                                        text = text[(endIdx + "<|tool_call_end|>".Length)..];
-                                    }
-                                    else
-                                    {
-                                        toolCallBuffer.Append(text);
-                                        text = "";
-                                    }
-                                }
-                                else
-                                {
-                                    // Look for start of tool call
-                                    var startIdx = text.IndexOf("<|tool_call_start|>");
-                                    if (startIdx >= 0)
-                                    {
-                                        logger.LogInformation("⚙️ Detected tool call start token");
-                                        // Output any buffered text before tool call
-                                        textBuffer.Append(text[..startIdx]);
-                                        if (textBuffer.Length > 0)
-                                        {
-                                            var escaped = System.Text.Json.JsonSerializer.Serialize(textBuffer.ToString())[1..^1];
-                                            await context.Response.WriteAsync($"event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{escaped}\"}}}}\n\n");
-                                            await context.Response.Body.FlushAsync();
-                                            textBuffer.Clear();
-                                        }
-
-                                        inToolCall = true;
-                                        text = text[(startIdx + "<|tool_call_start|>".Length)..];
-                                    }
-                                    else
-                                    {
-                                        // Regular text
-                                        textBuffer.Append(text);
-                                        logger.LogDebug("Text chunk: {Text}", text);
-                                        text = "";
-                                    }
-                                }
-                            }
-
-                            chunkCount++;
-                        }
-                    }
-                    catch { /* skip unparseable chunks */ }
-                }
+                // Resolve and use the appropriate handler for the target model
+                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(modelRoute.ToModel);
+                await handler.HandleResponseAsync(context, lmResp, modelRoute.ToModel, logger);
 
                 logger.LogInformation("<- 200 POST {Path} [Local LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
             }
@@ -507,6 +428,16 @@ try
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(
                     $"{{\"error\":\"Local LLM unreachable at {localLlmUrl}: {ex.Message}\"}}");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Unexpected error during LM Studio response handling");
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.StatusCode = 500;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync($"{{\"error\":\"Response handling failed: {ex.Message}\"}}");
+                }
             }
             return;
         }
