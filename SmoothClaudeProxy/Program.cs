@@ -93,9 +93,11 @@ try
     {
         Enabled = localLlmConfig.GetValue("Enabled", true),
         FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
+        FromPrompt = localLlmConfig.GetValue("FromPrompt", "")!,
         ToModel = localLlmConfig.GetValue("ToModel", "qwen/qwen2.5-coder-14b")!,
         IncludedTools = localLlmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
-        AllowedMcpServers = localLlmConfig.GetSection("AllowedMcpServers").Get<List<string>>() ?? new()
+        AllowedMcpTools = localLlmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
+        BlockedMcpTools = localLlmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new()
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -138,8 +140,9 @@ try
         var memCache = context.RequestServices.GetRequiredService<IMemoryCache>();
         var modelRoute = memCache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
 
-        // Only read body if model routing is enabled (to extract model field)
+        // Only read body if model routing is enabled (to extract model and prompt fields)
         string? model = null;
+        string? firstUserPrompt = null;
         if (modelRoute.Enabled && req.ContentType?.Contains("application/json") == true && req.ContentLength > 0)
         {
             try
@@ -151,6 +154,31 @@ try
                 using var doc = JsonDocument.Parse(body);
                 if (doc.RootElement.TryGetProperty("model", out var m))
                     model = m.GetString();
+                if (doc.RootElement.TryGetProperty("messages", out var msgs) && msgs.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var msg in msgs.EnumerateArray())
+                    {
+                        if (msg.TryGetProperty("role", out var role) && role.GetString() == "user"
+                            && msg.TryGetProperty("content", out var content))
+                        {
+                            if (content.ValueKind == JsonValueKind.String)
+                                firstUserPrompt = content.GetString();
+                            else if (content.ValueKind == JsonValueKind.Array)
+                            {
+                                foreach (var part in content.EnumerateArray())
+                                {
+                                    if (part.TryGetProperty("type", out var t) && t.GetString() == "text"
+                                        && part.TryGetProperty("text", out var txt))
+                                    {
+                                        firstUserPrompt = txt.GetString();
+                                        break;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
             }
             catch { /* non-JSON or parse failure — ignore */ }
         }
@@ -165,8 +193,10 @@ try
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
 
-        var isLmStudioRoute = modelRoute.Enabled
-            && model?.Contains(modelRoute.FromModel, StringComparison.OrdinalIgnoreCase) == true;
+        var matchesFromModel = model?.Contains(modelRoute.FromModel, StringComparison.OrdinalIgnoreCase) == true;
+        var matchesFromPrompt = !string.IsNullOrWhiteSpace(modelRoute.FromPrompt)
+            && firstUserPrompt?.StartsWith(modelRoute.FromPrompt, StringComparison.OrdinalIgnoreCase) == true;
+        var isLmStudioRoute = modelRoute.Enabled && (matchesFromModel || matchesFromPrompt);
         var routeTarget = isLmStudioRoute ? "LM Studio" : "Anthropic";
 
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
@@ -408,7 +438,7 @@ try
                             foreach (var tool in toolsField.EnumerateArray())
                             {
                                 var toolName = tool.TryGetProperty("name", out var nameCheck) ? nameCheck.GetString() ?? "" : "";
-                                if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpServers))
+                                if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpTools, modelRoute.BlockedMcpTools))
                                 {
                                     qwenSkippedCount++;
                                     continue;
@@ -876,6 +906,7 @@ try
         {
             settings.Enabled,
             settings.FromModel,
+            settings.FromPrompt,
             settings.ToModel,
             Target = localLlmUrl
         });
@@ -890,12 +921,14 @@ try
         var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
         if (body.Enabled.HasValue) settings.Enabled = body.Enabled.Value;
         if (body.FromModel is not null) settings.FromModel = body.FromModel;
+        if (body.FromPrompt is not null) settings.FromPrompt = body.FromPrompt;
         if (body.ToModel is not null) settings.ToModel = body.ToModel;
         cache.Set("model_route_settings", settings);
         return Results.Ok(new
         {
             settings.Enabled,
             settings.FromModel,
+            settings.FromPrompt,
             settings.ToModel,
             Target = localLlmUrl
         });
@@ -1141,17 +1174,22 @@ public class ModelRouteSettings
 {
     public bool Enabled { get; set; } = true;
     public string FromModel { get; set; } = "Haiku";
+    /// <summary>If non-empty, route to local LLM when the first user message starts with this prefix (case-insensitive).</summary>
+    public string FromPrompt { get; set; } = "";
     public string ToModel { get; set; } = "liquid/lfm2.5-1.2b";
     /// <summary>Built-in tools to include when forwarding to local LLM. Empty = allow all non-MCP tools.</summary>
     public List<string> IncludedTools { get; set; } = new();
-    /// <summary>MCP server names whose tools are allowed for local LLM. Empty = no MCP tools.</summary>
-    public List<string> AllowedMcpServers { get; set; } = new();
+    /// <summary>MCP tool name prefixes to allow for local LLM (starts-with, case-insensitive). Empty = no MCP tools.</summary>
+    public List<string> AllowedMcpTools { get; set; } = new();
+    /// <summary>Exact MCP tool names to block even if matched by AllowedMcpTools.</summary>
+    public List<string> BlockedMcpTools { get; set; } = new();
 }
 
 public class ModelRouteRequest
 {
     public bool? Enabled { get; set; }
     public string? FromModel { get; set; }
+    public string? FromPrompt { get; set; }
     public string? ToModel { get; set; }
 }
 
@@ -1218,13 +1256,15 @@ public static class PersistedOutputResolver
 
 public static class LocalLlmToolFilter
 {
-    public static bool IsAllowed(string toolName, IList<string> includedTools, IList<string> allowedMcpServers)
+    public static bool IsAllowed(string toolName, IList<string> includedTools, IList<string> allowedMcpTools, IList<string> blockedMcpTools)
     {
         if (toolName.StartsWith("mcp__", StringComparison.OrdinalIgnoreCase))
         {
-            if (allowedMcpServers.Count == 0) return false;
+            if (allowedMcpTools.Count == 0) return false;
             // Each entry is a case-insensitive prefix: "mcp__conductor" allows all conductor tools
-            return allowedMcpServers.Any(s => toolName.StartsWith(s, StringComparison.OrdinalIgnoreCase));
+            if (!allowedMcpTools.Any(s => toolName.StartsWith(s, StringComparison.OrdinalIgnoreCase))) return false;
+            // Blocked list takes precedence — exact match, case-insensitive
+            return !blockedMcpTools.Any(b => toolName.Equals(b, StringComparison.OrdinalIgnoreCase));
         }
 
         if (includedTools.Count == 0) return true;
