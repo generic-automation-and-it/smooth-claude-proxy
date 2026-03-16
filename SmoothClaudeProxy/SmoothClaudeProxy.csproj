@@ -22,5 +22,9 @@
     <PackageReference Include="Yarp.ReverseProxy" Version="2.1.0" />
   </ItemGroup>
 
+  <!-- Explicitly copy JSON translation tables to output -->
+  <ItemGroup>
+    <None Update="app_data/liquid-tool-translator.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 
 </Project>
