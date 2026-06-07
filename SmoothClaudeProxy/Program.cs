@@ -95,9 +95,6 @@ try
     var modelRouteDefaults = new ModelRouteSettings
     {
         Enabled = llmConfig.GetValue("Enabled", true),
-        FromModel = llmConfig.GetValue("FromModel", "")!,
-        FromPrompt = llmConfig.GetValue("FromPrompt", "")!,
-        ToModel = llmConfig.GetValue("ToModel", "qwen3.7-plus")!,
         ApiFormat = llmConfig.GetValue("ApiFormat", "anthropic")!,
         IncludedTools = llmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
         AllowedMcpTools = llmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
@@ -197,28 +194,22 @@ try
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
 
-        var routesToAnthropicByDefault = model?.StartsWith("claude-", StringComparison.OrdinalIgnoreCase) == true;
-        var routesToOpenCodeByDefault = !string.IsNullOrWhiteSpace(model) && !routesToAnthropicByDefault;
-        var matchesFromModel = !string.IsNullOrWhiteSpace(modelRoute.FromModel)
-            && model?.Contains(modelRoute.FromModel, StringComparison.OrdinalIgnoreCase) == true;
-        var matchesFromPrompt = !string.IsNullOrWhiteSpace(modelRoute.FromPrompt)
-            && firstUserPrompt?.StartsWith(modelRoute.FromPrompt, StringComparison.OrdinalIgnoreCase) == true;
-        var isLlmRoute = modelRoute.Enabled && (routesToOpenCodeByDefault || matchesFromModel || matchesFromPrompt);
+        var routesToAnthropic = model?.StartsWith("claude-", StringComparison.OrdinalIgnoreCase) == true;
+        var isLlmRoute = modelRoute.Enabled && !string.IsNullOrWhiteSpace(model) && !routesToAnthropic;
         var routeTarget = isLlmRoute ? "OpenCode" : "Anthropic";
 
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
             req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
 
-        var isQwen = modelRoute.ToModel.Contains("qwen", StringComparison.OrdinalIgnoreCase);
+        var isQwen = model?.Contains("qwen", StringComparison.OrdinalIgnoreCase) == true;
 
         // Route matching models to the alternate upstream.
         if (isLlmRoute)
         {
             // Anthropic-native passthrough (e.g. opencode.ai zen /v1/messages):
             // the upstream already speaks the Anthropic Messages API, so the inbound
-            // request needs no conversion. Forward the body unchanged except for the
-            // model field, and stream the SSE response straight back. No message/tool
-            // mapping, no response handler.
+            // request needs no conversion. Forward the body completely unchanged
+            // (including the model field) and stream the SSE response straight back.
             if (modelRoute.ApiFormat.Equals("anthropic", StringComparison.OrdinalIgnoreCase))
             {
                 var ptFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
@@ -232,29 +223,15 @@ try
                 ptReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion ?? "2023-06-01");
                 ptReq.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
 
-                // Rewrite only the model field; every other field passes through verbatim.
+                // Forward the body verbatim — model field stays as-is.
                 req.Body.Position = 0;
-                using (var ptReader = new StreamReader(req.Body, leaveOpen: true))
-                {
-                    var ptBodyText = await ptReader.ReadToEndAsync();
-                    using var ptDoc = JsonDocument.Parse(ptBodyText);
-                    using var ptMs = new MemoryStream();
-                    using (var ptWriter = new Utf8JsonWriter(ptMs))
-                    {
-                        ptWriter.WriteStartObject();
-                        ptWriter.WriteString("model", modelRoute.ToModel);
-                        foreach (var prop in ptDoc.RootElement.EnumerateObject())
-                        {
-                            if (prop.Name.Equals("model", StringComparison.OrdinalIgnoreCase)) continue;
-                            prop.WriteTo(ptWriter);
-                        }
-                        ptWriter.WriteEndObject();
-                    }
-                    ptReq.Content = new ByteArrayContent(ptMs.ToArray());
-                    ptReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-                }
+                using var ptBodyStream = new MemoryStream();
+                await req.Body.CopyToAsync(ptBodyStream);
+                ptBodyStream.Position = 0;
+                ptReq.Content = new StreamContent(ptBodyStream);
+                ptReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
-                logger.LogInformation("LLM passthrough -> {Url} [model {From} -> {To}]", ptUrl, model ?? "-", modelRoute.ToModel);
+                logger.LogInformation("LLM passthrough -> {Url} [model={Model}]", ptUrl, model ?? "-");
 
                 var ptBuffering = context.Features
                     .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
@@ -391,9 +368,9 @@ try
                 using (var w = new Utf8JsonWriter(ms))
                 {
                     w.WriteStartObject();
-                    w.WriteString("model", modelRoute.ToModel);
+                    w.WriteString("model", model);
 
-                    logger.LogInformation("Request preprocessing for Qwen: {ToModel}", modelRoute.ToModel);
+                    logger.LogInformation("Request preprocessing for model: {Model}", model);
 
                     if (isQwen)
                     {
@@ -669,7 +646,7 @@ try
                 proxyReq.Content = new ByteArrayContent(payload);
                 proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
-                logger.LogInformation("Forwarding to LLM /v1/chat/completions: {From} -> {To}", model, modelRoute.ToModel);
+                logger.LogInformation("Forwarding to LLM /v1/chat/completions: model={Model}", model);
             }
 
             var responseBuffering = context.Features
@@ -694,7 +671,7 @@ try
                                         || errorBody.Contains("initial prompt", StringComparison.OrdinalIgnoreCase);
                     if (isContextOverflow)
                     {
-                        logger.LogWarning("LLM context overflow — conversation too long for {Model}. Run /compact in Claude Code to reduce context, or increase the model context length for the configured LLM.", modelRoute.ToModel);
+                        logger.LogWarning("LLM context overflow — conversation too long for {Model}. Run /compact in Claude Code to reduce context, or increase the model context length for the configured LLM.", model);
                         context.Response.StatusCode = 400;
                         context.Response.ContentType = "application/json";
                         await context.Response.WriteAsync("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Context too long for the configured LLM. Run /compact in Claude Code to reduce context, or use a model with a larger context window.\"}}");
@@ -712,8 +689,8 @@ try
                 logger.LogInformation("Starting response handling");
 
                 // Resolve and use the appropriate handler for the target model
-                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(modelRoute.ToModel);
-                await handler.HandleResponseAsync(context, lmResp, modelRoute.ToModel, logger);
+                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
+                await handler.HandleResponseAsync(context, lmResp, model!, logger);
 
                 logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
             }
@@ -1023,50 +1000,41 @@ try
         return Results.Ok(new
         {
             settings.Enabled,
-            settings.FromModel,
-            settings.FromPrompt,
-            settings.ToModel,
             settings.ApiFormat,
             Target = llmUrl
         });
     })
         .WithName("GetModelRoute")
         .WithSummary("Get model routing settings")
-        .WithDescription("Returns the current model routing configuration. When enabled, models that do not start with 'claude-' are forwarded to the configured local or remote model target. FromModel and FromPrompt can be used as additional override matchers. If ToModel is set, the model field in the request body is rewritten.")
+        .WithDescription("Returns the current model routing configuration. When enabled, models that do not start with 'claude-' are forwarded to the configured alternate upstream.")
         .WithTags("Model Routing");
 
     app.MapPost("/override-model", (ModelRouteRequest body, IMemoryCache cache) =>
     {
         var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
         if (body.Enabled.HasValue) settings.Enabled = body.Enabled.Value;
-        if (body.FromModel is not null) settings.FromModel = body.FromModel;
-        if (body.FromPrompt is not null) settings.FromPrompt = body.FromPrompt;
-        if (body.ToModel is not null) settings.ToModel = body.ToModel;
         if (body.ApiFormat is not null) settings.ApiFormat = body.ApiFormat;
         cache.Set("model_route_settings", settings);
         return Results.Ok(new
         {
             settings.Enabled,
-            settings.FromModel,
-            settings.FromPrompt,
-            settings.ToModel,
             settings.ApiFormat,
             Target = llmUrl
         });
     })
         .WithName("SetModelRoute")
         .WithSummary("Update model routing settings")
-        .WithDescription("Updates the model routing config. When enabled, models that do not start with 'claude-' are routed to the alternate upstream by default. Set FromModel or FromPrompt for additional override matching. Set ToModel to rewrite the model field in the request body. Set ApiFormat to 'anthropic' for passthrough to a /v1/messages-compatible upstream or 'openai' for Anthropic-to-OpenAI conversion. Set Enabled to false to disable routing.")
+        .WithDescription("Updates the model routing config. Set ApiFormat to 'anthropic' for passthrough to a /v1/messages-compatible upstream or 'openai' for Anthropic-to-OpenAI conversion. Set Enabled to false to disable routing.")
         .WithTags("Model Routing");
 
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
         cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "", ToModel = "qwen3.7-plus", ApiFormat = "anthropic" });
+        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, ApiFormat = "anthropic" });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
-        .WithDescription("Resets model routing settings to defaults: enabled=true, fromModel='', toModel=qwen3.7-plus, apiFormat=anthropic.")
+        .WithDescription("Resets model routing settings to defaults: enabled=true, apiFormat=anthropic.")
         .WithTags("Model Routing");
 
     app.MapReverseProxy();
@@ -1075,8 +1043,8 @@ try
     Log.Information("Workspace: {Workspace}", workspace);
     Log.Information("Database: {DbPath}", dbPath);
     Log.Information("Logs: {LogPath}", logPath);
-    Log.Information("LLM: {LlmUrl} (routing '{FromModel}' -> '{ToModel}')",
-        llmUrl, modelRouteDefaults.FromModel, modelRouteDefaults.ToModel);
+    Log.Information("LLM: {LlmUrl} (apiFormat={ApiFormat})",
+        llmUrl, modelRouteDefaults.ApiFormat);
 
     app.Run();
 }
@@ -1294,10 +1262,6 @@ public class LabelRequest
 public class ModelRouteSettings
 {
     public bool Enabled { get; set; } = true;
-    public string FromModel { get; set; } = "";
-    /// <summary>If non-empty, route to the configured LLM when the first user message starts with this prefix (case-insensitive).</summary>
-    public string FromPrompt { get; set; } = "";
-    public string ToModel { get; set; } = "qwen3.7-plus";
     /// <summary>Upstream API shape: "anthropic" = pure passthrough to a /v1/messages endpoint (no conversion);
     /// "openai" = convert to OpenAI chat format and back (OpenAI-compatible LLM path).</summary>
     public string ApiFormat { get; set; } = "anthropic";
@@ -1312,9 +1276,6 @@ public class ModelRouteSettings
 public class ModelRouteRequest
 {
     public bool? Enabled { get; set; }
-    public string? FromModel { get; set; }
-    public string? FromPrompt { get; set; }
-    public string? ToModel { get; set; }
     public string? ApiFormat { get; set; }
 }
 
