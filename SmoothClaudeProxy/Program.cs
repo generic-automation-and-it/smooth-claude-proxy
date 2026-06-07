@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -16,10 +17,11 @@ using MEL = Microsoft.Extensions.Logging;
 var workspace = Environment.GetEnvironmentVariable("WORKSPACE_PATH") ?? "/data";
 var dbPath = Path.Combine(workspace, "claude-auth.db");
 var logPath = Path.Combine(workspace, "logs", "claude-proxy-.log");
-var localLlmLogPath = Path.Combine(workspace, "logs", "local-llm-service-.log");
+var llmLogPath = Path.Combine(workspace, "logs", "llm-service-.log");
 var toolsLogPath = Path.Combine(workspace, "logs", "tools-log.log"); // Non-rolling tools log
-var localLlmUrl = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"); // env var overrides appsettings
-var localLlmToken = Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"); // env var overrides appsettings
+var llmUrl = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"); // env var overrides appsettings
+var llmToken = Environment.GetEnvironmentVariable("OPENCODE_API_KEY")
+    ?? Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"); // env var overrides appsettings
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -28,12 +30,11 @@ Log.Logger = new LoggerConfiguration()
     .WriteTo.Logger(lc => lc
         .MinimumLevel.Information()
         .Filter.ByIncludingOnly(le =>
-            le.MessageTemplate?.Text?.Contains("Local LLM", StringComparison.OrdinalIgnoreCase) == true ||
-            le.MessageTemplate?.Text?.Contains("LM Studio", StringComparison.OrdinalIgnoreCase) == true ||
+            le.MessageTemplate?.Text?.Contains("LLM", StringComparison.OrdinalIgnoreCase) == true ||
             le.MessageTemplate?.Text?.Contains("/api/v1/chat", StringComparison.OrdinalIgnoreCase) == true ||
-            le.Properties.ContainsKey("Route") && le.Properties["Route"]?.ToString() == "\"LM Studio\"")
+            le.Properties.ContainsKey("Route") && le.Properties["Route"]?.ToString() == "\"OpenCode\"")
         .WriteTo.Async(a => a.File(
-            localLlmLogPath,
+            llmLogPath,
             rollingInterval: RollingInterval.Day,
             retainedFileCountLimit: 7)))
     .WriteTo.Logger(lc => lc
@@ -72,7 +73,7 @@ try
     builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<ILiteDatabase>(_ => new LiteDatabase(dbPath));
 
-    // Register local LLM response handlers with keyed DI (open-closed principle)
+    // Register LLM response handlers with keyed DI (open-closed principle)
     builder.Services.AddKeyedScoped<ILocalLLMResponseHandler>(
         "qwen/qwen2.5-coder-14b",
         (sp, key) => new Qwen2_5ResponseHandler());
@@ -84,20 +85,20 @@ try
 
     var app = builder.Build();
 
-    // Seed local LLM service routing settings from appsettings.json
+    // Seed LLM routing settings from appsettings.json
     var startupCache = app.Services.GetRequiredService<IMemoryCache>();
-    var localLlmConfig = builder.Configuration.GetSection("LocalLLMService");
-    localLlmUrl ??= localLlmConfig.GetValue<string>("BaseUrl") ?? "http://host.docker.internal:1234";
-    localLlmToken ??= localLlmConfig.GetValue<string>("AuthToken") ?? "lmstudio";
+    var llmConfig = builder.Configuration.GetSection("LlmService");
+    if (!llmConfig.GetChildren().Any())
+        llmConfig = builder.Configuration.GetSection("LocalLLMService");
+    llmUrl ??= llmConfig.GetValue<string>("BaseUrl") ?? "http://host.docker.internal:1234";
+    llmToken ??= llmConfig.GetValue<string>("AuthToken") ?? "";
     var modelRouteDefaults = new ModelRouteSettings
     {
-        Enabled = localLlmConfig.GetValue("Enabled", true),
-        FromModel = localLlmConfig.GetValue("FromModel", "Haiku")!,
-        FromPrompt = localLlmConfig.GetValue("FromPrompt", "")!,
-        ToModel = localLlmConfig.GetValue("ToModel", "qwen/qwen2.5-coder-14b")!,
-        IncludedTools = localLlmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
-        AllowedMcpTools = localLlmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
-        BlockedMcpTools = localLlmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new()
+        Enabled = llmConfig.GetValue("Enabled", true),
+        ApiFormat = llmConfig.GetValue("ApiFormat", "anthropic")!,
+        IncludedTools = llmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
+        AllowedMcpTools = llmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
+        BlockedMcpTools = llmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new()
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -193,21 +194,79 @@ try
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
 
-        var matchesFromModel = model?.Contains(modelRoute.FromModel, StringComparison.OrdinalIgnoreCase) == true;
-        var matchesFromPrompt = !string.IsNullOrWhiteSpace(modelRoute.FromPrompt)
-            && firstUserPrompt?.StartsWith(modelRoute.FromPrompt, StringComparison.OrdinalIgnoreCase) == true;
-        var isLmStudioRoute = modelRoute.Enabled && (matchesFromModel || matchesFromPrompt);
-        var routeTarget = isLmStudioRoute ? "LM Studio" : "Anthropic";
+        var routesToAnthropic = model?.StartsWith("claude-", StringComparison.OrdinalIgnoreCase) == true;
+        var isLlmRoute = modelRoute.Enabled && !string.IsNullOrWhiteSpace(model) && !routesToAnthropic;
+        var routeTarget = isLlmRoute ? "OpenCode" : "Anthropic";
 
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
             req.Method, req.Path, req.QueryString, authType, model ?? "-", routeTarget);
 
-        var isQwen = modelRoute.ToModel.Contains("qwen", StringComparison.OrdinalIgnoreCase);
+        var isQwen = model?.Contains("qwen", StringComparison.OrdinalIgnoreCase) == true;
 
-        // Route matching models to local LLM via LM Studio
-        if (isLmStudioRoute)
+        // Route matching models to the alternate upstream.
+        if (isLlmRoute)
         {
-            // LM Studio does not support the count_tokens endpoint — intercept it and
+            // Anthropic-native passthrough (e.g. opencode.ai zen /v1/messages):
+            // the upstream already speaks the Anthropic Messages API, so the inbound
+            // request needs no conversion. Forward the body completely unchanged
+            // (including the model field) and stream the SSE response straight back.
+            if (modelRoute.ApiFormat.Equals("anthropic", StringComparison.OrdinalIgnoreCase))
+            {
+                var ptFactory = context.RequestServices.GetRequiredService<IHttpClientFactory>();
+                using var ptClient = ptFactory.CreateClient();
+                ptClient.Timeout = TimeSpan.FromMinutes(10);
+
+                var ptUrl = $"{llmUrl.TrimEnd('/')}{req.Path}{req.QueryString}";
+                using var ptReq = new HttpRequestMessage(HttpMethod.Post, ptUrl);
+                ptReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {llmToken}");
+                ptReq.Headers.TryAddWithoutValidation("x-api-key", llmToken);
+                ptReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion ?? "2023-06-01");
+                ptReq.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
+
+                // Forward the body verbatim — model field stays as-is.
+                req.Body.Position = 0;
+                using var ptBodyStream = new MemoryStream();
+                await req.Body.CopyToAsync(ptBodyStream);
+                ptBodyStream.Position = 0;
+                ptReq.Content = new StreamContent(ptBodyStream);
+                ptReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+
+                logger.LogInformation("LLM passthrough -> {Url} [model={Model}]", ptUrl, model ?? "-");
+
+                var ptBuffering = context.Features
+                    .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
+                ptBuffering?.DisableBuffering();
+
+                try
+                {
+                    using var ptResp = await ptClient.SendAsync(ptReq, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+                    context.Response.StatusCode = (int)ptResp.StatusCode;
+                    if (ptResp.Content.Headers.ContentType is not null)
+                        context.Response.ContentType = ptResp.Content.Headers.ContentType.ToString();
+
+                    if (!ptResp.IsSuccessStatusCode)
+                        logger.LogWarning("<- {StatusCode} from LLM passthrough {Url}", (int)ptResp.StatusCode, ptUrl);
+
+                    await using var ptStream = await ptResp.Content.ReadAsStreamAsync(context.RequestAborted);
+                    await ptStream.CopyToAsync(context.Response.Body, context.RequestAborted);
+                    await context.Response.Body.FlushAsync(context.RequestAborted);
+                    logger.LogInformation("<- {StatusCode} {Path} [LLM passthrough]", (int)ptResp.StatusCode, req.Path);
+                }
+                catch (HttpRequestException ex)
+                {
+                    logger.LogError(ex, "LLM passthrough connection failed at {Url} — is it reachable?", ptUrl);
+                    if (!context.Response.HasStarted)
+                    {
+                        context.Response.StatusCode = 502;
+                        context.Response.ContentType = "application/json";
+                        await context.Response.WriteAsync(
+                            $"{{\"error\":\"LLM unreachable at {llmUrl}: {ex.Message}\"}}");
+                    }
+                }
+                return;
+            }
+
+            // This LLM route does not support the count_tokens endpoint — intercept it and
             // return an estimate so Claude Code can manage its own context window.
             // Without this, Claude Code gets a 400, can't track context size, and
             // eventually sends an oversized request that Qwen silently truncates,
@@ -219,7 +278,7 @@ try
                 using var ctReader = new StreamReader(req.Body, leaveOpen: true);
                 var ctBody = await ctReader.ReadToEndAsync();
                 var estimatedTokens = Math.Max(1000, ctBody.Length / 4);
-                logger.LogInformation("count_tokens intercepted for LM Studio route — estimated {Tokens} tokens from {Bytes} bytes", estimatedTokens, ctBody.Length);
+                logger.LogInformation("count_tokens intercepted for LLM route — estimated {Tokens} tokens from {Bytes} bytes", estimatedTokens, ctBody.Length);
                 context.Response.StatusCode = 200;
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync($"{{\"input_tokens\":{estimatedTokens}}}");
@@ -230,12 +289,12 @@ try
             using var httpClient = httpFactory.CreateClient();
             httpClient.Timeout = TimeSpan.FromMinutes(10);
 
-            var targetUrl = $"{localLlmUrl.TrimEnd('/')}/v1/chat/completions";
+            var targetUrl = $"{llmUrl.TrimEnd('/')}/v1/chat/completions";
             logger.LogInformation("Target endpoint: {Endpoint}", targetUrl.Split('/').Last());
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
-            proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {localLlmToken}");
+            proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {llmToken}");
 
-            // Convert and forward request to local LLM
+            // Convert and forward request to the configured LLM
             if (req.ContentLength > 0 || req.ContentType is not null)
             {
                 req.Body.Position = 0;
@@ -309,9 +368,9 @@ try
                 using (var w = new Utf8JsonWriter(ms))
                 {
                     w.WriteStartObject();
-                    w.WriteString("model", modelRoute.ToModel);
+                    w.WriteString("model", model);
 
-                    logger.LogInformation("Request preprocessing for Qwen: {ToModel}", modelRoute.ToModel);
+                    logger.LogInformation("Request preprocessing for model: {Model}", model);
 
                     if (isQwen)
                     {
@@ -587,7 +646,7 @@ try
                 proxyReq.Content = new ByteArrayContent(payload);
                 proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
-                logger.LogInformation("Forwarding to LM Studio /v1/chat/completions: {From} -> {To}", model, modelRoute.ToModel);
+                logger.LogInformation("Forwarding to LLM /v1/chat/completions: model={Model}", model);
             }
 
             var responseBuffering = context.Features
@@ -596,10 +655,10 @@ try
 
             try
             {
-                logger.LogInformation("Sending request to LM Studio: {Url}", targetUrl);
+                logger.LogInformation("Sending request to LLM: {Url}", targetUrl);
                 using var lmResp = await httpClient.SendAsync(proxyReq, HttpCompletionOption.ResponseHeadersRead);
 
-                logger.LogInformation("<- {StatusCode} from local LLM, content type: {ContentType}, length: {Length}",
+                logger.LogInformation("<- {StatusCode} from LLM, content type: {ContentType}, length: {Length}",
                     (int)lmResp.StatusCode,
                     lmResp.Content.Headers.ContentType,
                     lmResp.Content.Headers.ContentLength);
@@ -612,14 +671,14 @@ try
                                         || errorBody.Contains("initial prompt", StringComparison.OrdinalIgnoreCase);
                     if (isContextOverflow)
                     {
-                        logger.LogWarning("LM Studio context overflow — conversation too long for {Model}. Run /compact in Claude Code to reduce context, or increase the model context length in LM Studio.", modelRoute.ToModel);
+                        logger.LogWarning("LLM context overflow — conversation too long for {Model}. Run /compact in Claude Code to reduce context, or increase the model context length for the configured LLM.", model);
                         context.Response.StatusCode = 400;
                         context.Response.ContentType = "application/json";
-                        await context.Response.WriteAsync("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Context too long for local model. Run /compact in Claude Code to reduce context, or load the model with a larger context window in LM Studio.\"}}");
+                        await context.Response.WriteAsync("{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Context too long for the configured LLM. Run /compact in Claude Code to reduce context, or use a model with a larger context window.\"}}");
                     }
                     else
                     {
-                        logger.LogWarning("<- {StatusCode} from local LLM: {Error}", (int)lmResp.StatusCode, errorBody);
+                        logger.LogWarning("<- {StatusCode} from LLM: {Error}", (int)lmResp.StatusCode, errorBody);
                         context.Response.StatusCode = (int)lmResp.StatusCode;
                         context.Response.ContentType = "application/json";
                         await context.Response.WriteAsync(errorBody);
@@ -630,22 +689,22 @@ try
                 logger.LogInformation("Starting response handling");
 
                 // Resolve and use the appropriate handler for the target model
-                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(modelRoute.ToModel);
-                await handler.HandleResponseAsync(context, lmResp, modelRoute.ToModel, logger);
+                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
+                await handler.HandleResponseAsync(context, lmResp, model!, logger);
 
-                logger.LogInformation("<- 200 POST {Path} [Local LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
+                logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
             }
             catch (HttpRequestException ex)
             {
-                logger.LogError(ex, "Local LLM connection failed at {Url} — is it running?", localLlmUrl);
+                logger.LogError(ex, "LLM connection failed at {Url} — is it running?", llmUrl);
                 context.Response.StatusCode = 502;
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(
-                    $"{{\"error\":\"Local LLM unreachable at {localLlmUrl}: {ex.Message}\"}}");
+                    $"{{\"error\":\"LLM unreachable at {llmUrl}: {ex.Message}\"}}");
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Unexpected error during LM Studio response handling");
+                logger.LogError(ex, "Unexpected error during LLM response handling");
                 if (!context.Response.HasStarted)
                 {
                     context.Response.StatusCode = 500;
@@ -734,6 +793,10 @@ try
 
     app.MapOpenApi();
     app.MapScalarApiReference();
+
+    app.MapMethods("/", [Microsoft.AspNetCore.Http.HttpMethods.Head, Microsoft.AspNetCore.Http.HttpMethods.Get],
+        () => Results.Ok(new { status = "ok" }))
+        .ExcludeFromDescription();
 
     app.MapGet("/health", () => Results.Content("{\"status\":\"ok\",\"target\":\"https://api.anthropic.com\"}", "application/json"))
         .WithName("Health")
@@ -937,47 +1000,41 @@ try
         return Results.Ok(new
         {
             settings.Enabled,
-            settings.FromModel,
-            settings.FromPrompt,
-            settings.ToModel,
-            Target = localLlmUrl
+            settings.ApiFormat,
+            Target = llmUrl
         });
     })
         .WithName("GetModelRoute")
-        .WithSummary("Get LM Studio model routing settings")
-        .WithDescription("Returns the current model routing configuration. When enabled, requests matching FromModel are forwarded to LM Studio. If ToModel is set, the model field in the request body is rewritten.")
+        .WithSummary("Get model routing settings")
+        .WithDescription("Returns the current model routing configuration. When enabled, models that do not start with 'claude-' are forwarded to the configured alternate upstream.")
         .WithTags("Model Routing");
 
     app.MapPost("/override-model", (ModelRouteRequest body, IMemoryCache cache) =>
     {
         var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
         if (body.Enabled.HasValue) settings.Enabled = body.Enabled.Value;
-        if (body.FromModel is not null) settings.FromModel = body.FromModel;
-        if (body.FromPrompt is not null) settings.FromPrompt = body.FromPrompt;
-        if (body.ToModel is not null) settings.ToModel = body.ToModel;
+        if (body.ApiFormat is not null) settings.ApiFormat = body.ApiFormat;
         cache.Set("model_route_settings", settings);
         return Results.Ok(new
         {
             settings.Enabled,
-            settings.FromModel,
-            settings.FromPrompt,
-            settings.ToModel,
-            Target = localLlmUrl
+            settings.ApiFormat,
+            Target = llmUrl
         });
     })
         .WithName("SetModelRoute")
-        .WithSummary("Update LM Studio model routing settings")
-        .WithDescription("Updates the model routing config. Set FromModel to the pattern to intercept (e.g. 'Haiku'). Set ToModel to rewrite the model field in the request body (e.g. a model loaded in LM Studio). Set Enabled to false to disable routing. Send empty string for ToModel to clear it.")
+        .WithSummary("Update model routing settings")
+        .WithDescription("Updates the model routing config. Set ApiFormat to 'anthropic' for passthrough to a /v1/messages-compatible upstream or 'openai' for Anthropic-to-OpenAI conversion. Set Enabled to false to disable routing.")
         .WithTags("Model Routing");
 
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
         cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, FromModel = "Haiku", ToModel = "qwen/qwen2.5-coder-14b" });
+        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, ApiFormat = "anthropic" });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
-        .WithDescription("Resets model routing settings to defaults: enabled=true, fromModel=Haiku, toModel=null.")
+        .WithDescription("Resets model routing settings to defaults: enabled=true, apiFormat=anthropic.")
         .WithTags("Model Routing");
 
     app.MapReverseProxy();
@@ -986,8 +1043,8 @@ try
     Log.Information("Workspace: {Workspace}", workspace);
     Log.Information("Database: {DbPath}", dbPath);
     Log.Information("Logs: {LogPath}", logPath);
-    Log.Information("Local LLM: {LocalLlmUrl} (routing '{FromModel}' -> '{ToModel}')",
-        localLlmUrl, modelRouteDefaults.FromModel, modelRouteDefaults.ToModel);
+    Log.Information("LLM: {LlmUrl} (apiFormat={ApiFormat})",
+        llmUrl, modelRouteDefaults.ApiFormat);
 
     app.Run();
 }
@@ -1205,13 +1262,12 @@ public class LabelRequest
 public class ModelRouteSettings
 {
     public bool Enabled { get; set; } = true;
-    public string FromModel { get; set; } = "Haiku";
-    /// <summary>If non-empty, route to local LLM when the first user message starts with this prefix (case-insensitive).</summary>
-    public string FromPrompt { get; set; } = "";
-    public string ToModel { get; set; } = "liquid/lfm2.5-1.2b";
-    /// <summary>Built-in tools to include when forwarding to local LLM. Empty = allow all non-MCP tools.</summary>
+    /// <summary>Upstream API shape: "anthropic" = pure passthrough to a /v1/messages endpoint (no conversion);
+    /// "openai" = convert to OpenAI chat format and back (OpenAI-compatible LLM path).</summary>
+    public string ApiFormat { get; set; } = "anthropic";
+    /// <summary>Built-in tools to include when forwarding to the configured LLM. Empty = allow all non-MCP tools.</summary>
     public List<string> IncludedTools { get; set; } = new();
-    /// <summary>MCP tool name prefixes to allow for local LLM (starts-with, case-insensitive). Empty = no MCP tools.</summary>
+    /// <summary>MCP tool name prefixes to allow for the configured LLM (starts-with, case-insensitive). Empty = no MCP tools.</summary>
     public List<string> AllowedMcpTools { get; set; } = new();
     /// <summary>Exact MCP tool names to block even if matched by AllowedMcpTools.</summary>
     public List<string> BlockedMcpTools { get; set; } = new();
@@ -1220,9 +1276,7 @@ public class ModelRouteSettings
 public class ModelRouteRequest
 {
     public bool? Enabled { get; set; }
-    public string? FromModel { get; set; }
-    public string? FromPrompt { get; set; }
-    public string? ToModel { get; set; }
+    public string? ApiFormat { get; set; }
 }
 
 /// <summary>

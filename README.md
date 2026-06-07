@@ -1,6 +1,25 @@
 # SmoothClaudeProxy
 
-A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to switch between accounts by label, and model routing to a local LM Studio instance.
+A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to switch between accounts by label, and optional model routing to an alternate upstream such as OpenCode Go.
+
+## Start
+
+Start the proxy in detached mode so it keeps running in the background:
+
+```bash
+# Docker Compose
+docker compose up --build -d
+
+# Podman Compose
+podman-compose up --build -d
+```
+
+If you want routed requests to use OpenCode Go, export `OPENCODE_API_KEY` before starting:
+
+```bash
+export OPENCODE_API_KEY=your-opencode-key
+docker compose up --build -d
+```
 
 ## Login
 
@@ -33,8 +52,8 @@ Claude Code  -->  localhost:5066 (YARP in Docker)  -->  https://api.anthropic.co
 Model routing (optional):
 
 ```
-Claude Code  -->  localhost:5066  -->  http://localhost:1234 (LM Studio)
-                  (Haiku model pattern matched → rewritten + forwarded)
+Claude Code  -->  localhost:5066  -->  https://opencode.ai/zen/go (OpenCode Go)
+                  (any model not starting with Sonnet or Opus → rewritten + forwarded)
 ```
 
 ## Prerequisites
@@ -55,6 +74,13 @@ docker compose logs -f
 
 # Stop
 docker compose down
+```
+
+If you want the OpenCode route, export your API key before starting the container:
+
+```bash
+export OPENCODE_API_KEY=your-opencode-key
+docker compose up --build -d
 ```
 
 ### Podman Compose
@@ -173,9 +199,9 @@ curl http://localhost:5066/override
 curl -X DELETE http://localhost:5066/override
 ```
 
-### Model Routing (LM Studio)
+### Model Routing
 
-Routes requests matching a model pattern to a local LM Studio instance instead of Anthropic. Defaults to routing `Haiku` → `qwen/qwen2.5-coder-14b`.
+Routes requests to the configured alternate upstream instead of Anthropic when the inbound model does not start with `claude-`. The default config sends those requests to OpenCode Go using Anthropic-compatible passthrough at `https://opencode.ai/zen/go/v1/messages`, rewriting only the `model` field to `qwen3.7-plus`.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -190,12 +216,30 @@ curl http://localhost:5066/override-model
 # Enable routing with custom models
 curl -X POST http://localhost:5066/override-model \
   -H "Content-Type: application/json" \
-  -d '{"enabled":true,"fromModel":"Haiku","toModel":"qwen/qwen2.5-coder-14b"}'
+  -d '{"enabled":true,"toModel":"qwen3.7-plus","apiFormat":"anthropic"}'
 
 # Disable routing
 curl -X POST http://localhost:5066/override-model \
   -H "Content-Type: application/json" \
   -d '{"enabled":false}'
+```
+
+Example direct OpenCode Go request:
+
+```bash
+export OPENCODE_API_KEY=your-opencode-key
+
+curl https://opencode.ai/zen/go/v1/messages \
+  -H "content-type: application/json" \
+  -H "x-api-key: $OPENCODE_API_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "qwen3.7-plus",
+    "max_tokens": 128,
+    "messages": [
+      { "role": "user", "content": "Say hello in one sentence." }
+    ]
+  }'
 ```
 
 ## Environment Variables
@@ -205,13 +249,15 @@ curl -X POST http://localhost:5066/override-model \
 | `CLAUDE_PROXY_DIR` | `~/.claude/proxy` | Host path for DB and logs (compose only) |
 | `WORKSPACE_PATH` | `/data` | Container-internal workspace path |
 | `LOG_TOKEN_FORMAT` | `true` | Log bearer token format for debugging |
-| `LMSTUDIO_BASE_URL` | `http://localhost:1234` | LM Studio base URL for model routing |
+| `OPENCODE_API_KEY` | unset | API key for OpenCode Go passthrough auth |
+| `LMSTUDIO_BASE_URL` | `https://opencode.ai/zen/go` via appsettings | Optional override for the alternate model-routing base URL |
+| `LMSTUDIO_AUTH_TOKEN` | unset | Legacy fallback auth token env var for alternate model routing |
 
 ## How It Works
 
 1. Claude Code sends requests with `Authorization: Bearer <token>`
 2. If an **active session** is cached, auth headers are replaced before forwarding — inbound token is ignored
-3. If the request `model` matches the routing pattern (default: "Haiku"), it is forwarded to LM Studio instead of Anthropic, with Anthropic→OpenAI format conversion
+3. If the request `model` does not start with `claude-`, it is forwarded to the configured alternate upstream instead of Anthropic
 4. Otherwise, the token is recorded to LiteDB via a background channel (non-blocking)
 5. YARP forwards the request to `api.anthropic.com`; SSE streaming passes through unbuffered
 6. Rate limit headers from the response are captured and persisted per token

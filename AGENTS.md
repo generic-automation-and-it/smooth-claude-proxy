@@ -101,7 +101,7 @@ sequenceDiagram
 - **Rate limit header capture**: After each proxied response, `anthropic-ratelimit-input-tokens-remaining`, `anthropic-ratelimit-output-tokens-remaining`, `anthropic-ratelimit-input-tokens-reset`, and `anthropic-ratelimit-output-tokens-reset` are read and persisted with the `UserRecord`. Values are stored as `long` (rounded from the header's double string).
 - **Token-based dedup**: Primary key is `BearerToken`. Each new token gets one DB record. No email-based dedup or stale token deletion currently — one token → one record at rest.
 - **Override session**: `POST /override/{identifier}` loads a user's credentials from LiteDB into `IMemoryCache`, resolved by `Email` or `Label`. All subsequent proxied requests use those credentials (auth headers replaced) and skip DB writes. `DELETE /override` returns to pass-through mode.
-- **Model routing to LM Studio**: When the request body's `model` field contains the `FromModel` pattern (default: "Haiku", case-insensitive), the request is forwarded to a local LM Studio instance instead of Anthropic. Controlled via `IMemoryCache`-backed `ModelRouteSettings` (defaults: `Enabled=true`, `FromModel="Haiku"`, `ToModel=null`). The `LMSTUDIO_BASE_URL` env var controls the target (default: `http://localhost:1234`). If `ToModel` is set, the `model` field in the request body is rewritten before forwarding. These requests bypass YARP entirely — HttpClient streams the response directly. No DB writes or rate-limit capture for LM Studio requests. LM Studio accepts both `x-api-key` and `Authorization: Bearer` headers. Settings are changeable at runtime via `/override-model` endpoints.
+- **Model routing to alternate upstream**: Requests where the `model` field does not start with `claude-` are forwarded to an alternate upstream (default: OpenCode Go at `https://opencode.ai/zen/go`) instead of Anthropic. The request body is forwarded verbatim with no model rewriting. Controlled via `IMemoryCache`-backed `ModelRouteSettings` (defaults: `Enabled=true`, `ApiFormat="anthropic"`). The `LMSTUDIO_BASE_URL` env var controls the target URL, and `OPENCODE_API_KEY` provides auth. These requests bypass YARP entirely — HttpClient streams the response directly. No DB writes or rate-limit capture for non-Claude requests. Settings are changeable at runtime via `/override-model` endpoints.
 - **Channel write gated on active session**: When an active session is set, the channel write is skipped entirely — no DB record is updated for proxied requests in session mode.
 - **YARP catch-all route**: `{**catch-all}` matches everything — but `MapGet`/`MapPost`/`MapDelete`/`MapPatch` endpoints are registered before `MapReverseProxy()`, so they take precedence. Order matters.
 - **10-minute activity timeout**: YARP's `ActivityTimeout` is set to 10 minutes for long-running Claude requests. Default (100s) will kill streaming responses for complex prompts.
@@ -120,9 +120,9 @@ sequenceDiagram
 | `POST` | `/override/{identifier}` | Activates a session by email or label; subsequent requests proxy as that user |
 | `GET` | `/override` | Returns current override session (token masked), or 404 |
 | `DELETE` | `/override` | Clears override session; proxy returns to pass-through mode |
-| `GET` | `/override-model` | Returns current LM Studio model routing settings |
-| `POST` | `/override-model` | Updates model routing: `Enabled`, `FromModel`, `ToModel` |
-| `DELETE` | `/override-model` | Resets model routing to defaults (enabled, from=Haiku, to=null) |
+| `GET` | `/override-model` | Returns current model routing settings |
+| `POST` | `/override-model` | Updates model routing: `Enabled`, `ApiFormat` |
+| `DELETE` | `/override-model` | Resets model routing to defaults (enabled, apiFormat=anthropic) |
 | `GET` | `/openapi/v1.json` | OpenAPI spec |
 | `GET` | `/scalar/v1` | Scalar interactive API docs UI |
 
@@ -158,3 +158,5 @@ sequenceDiagram
 | 2026-03-13 | Renamed `/users` endpoints to `/logins` | - |
 | 2026-03-14 | Route haiku models to local LM Studio via `LMSTUDIO_BASE_URL` with runtime settings | - |
 | 2026-03-14 | `/override-model` API for runtime model routing config (enabled, fromModel, toModel) | - |
+| 2026-06-07 | Simplified model routing: removed `FromModel`, `FromPrompt`, `ToModel` fields; routing now based solely on model prefix (claude-* → Anthropic, others → alternate upstream); model field forwarded verbatim with no rewriting | - |
+| 2026-06-07 | Added Anthropic-native passthrough mode (`ApiFormat="anthropic"`) for opencode.ai and compatible upstreams | - |
