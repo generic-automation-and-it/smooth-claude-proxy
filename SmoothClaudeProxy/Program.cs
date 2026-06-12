@@ -98,7 +98,8 @@ try
         ApiFormat = llmConfig.GetValue("ApiFormat", "anthropic")!,
         IncludedTools = llmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
         AllowedMcpTools = llmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
-        BlockedMcpTools = llmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new()
+        BlockedMcpTools = llmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new(),
+        StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels", false)
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -223,13 +224,44 @@ try
                 ptReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion ?? "2023-06-01");
                 ptReq.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
 
-                // Forward the body verbatim — model field stays as-is.
+                // Forward the body as-is — model field stays untouched. If the client set
+                // cache_control anywhere (block-level or top-level), it passes through
+                // unchanged. If the request has none at all, inject a top-level
+                // cache_control so anthropic-compatible upstreams (e.g. MiniMax) enable
+                // prompt caching automatically.
                 req.Body.Position = 0;
-                using var ptBodyStream = new MemoryStream();
-                await req.Body.CopyToAsync(ptBodyStream);
-                ptBodyStream.Position = 0;
-                ptReq.Content = new StreamContent(ptBodyStream);
-                ptReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+                using var ptReader = new StreamReader(req.Body, leaveOpen: true);
+                var ptBody = await ptReader.ReadToEndAsync();
+                try
+                {
+                    using var ptDoc = JsonDocument.Parse(ptBody);
+                    // Substring scan is a fast negative check only; it can false-positive on
+                    // prompt text that mentions cache_control, so confirm structurally.
+                    var hasCacheControl = ptBody.Contains("\"cache_control\"", StringComparison.Ordinal)
+                        && ContainsCacheControlProperty(ptDoc.RootElement);
+                    if (!hasCacheControl && ptDoc.RootElement.ValueKind == JsonValueKind.Object)
+                    {
+                        using var ptMs = new MemoryStream();
+                        using (var ptWriter = new Utf8JsonWriter(ptMs))
+                        {
+                            // Append after the original properties to keep their order intact.
+                            ptWriter.WriteStartObject();
+                            foreach (var prop in ptDoc.RootElement.EnumerateObject())
+                                prop.WriteTo(ptWriter);
+                            ptWriter.WritePropertyName("cache_control");
+                            ptWriter.WriteStartObject();
+                            ptWriter.WriteString("type", "ephemeral");
+                            ptWriter.WriteEndObject();
+                            ptWriter.WriteEndObject();
+                        }
+                        ptBody = Encoding.UTF8.GetString(ptMs.ToArray());
+                        logger.LogInformation("Injected top-level cache_control (ephemeral) — request had none");
+                    }
+                }
+                catch (JsonException) { /* non-JSON body — forward unchanged */ }
+                ptReq.Content = new StringContent(ptBody, Encoding.UTF8, "application/json");
+                ptReq.Content.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
                 logger.LogInformation("LLM passthrough -> {Url} [model={Model}]", ptUrl, model ?? "-");
 
@@ -294,6 +326,11 @@ try
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
             proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {llmToken}");
 
+            // StripNonClaudeModels off (default): forward the body verbatim and stream the
+            // response straight back. Qwen always runs the conversion pipeline regardless —
+            // Qwen2_5ResponseHandler requires the converted non-stream flow.
+            var verbatim = !modelRoute.StripNonClaudeModels && !isQwen;
+
             // Convert and forward request to the configured LLM
             if (req.ContentLength > 0 || req.ContentType is not null)
             {
@@ -302,351 +339,338 @@ try
                 var bodyText = await bodyReader.ReadToEndAsync();
                 logger.LogInformation("Original request body size: {Bytes} bytes", bodyText.Length);
 
-                using var bodyDoc = JsonDocument.Parse(bodyText);
-                var root = bodyDoc.RootElement;
-
-                // Log what fields are in the request
-                var requestFields = new List<string>();
-                foreach (var prop in root.EnumerateObject())
-                    requestFields.Add(prop.Name);
-                logger.LogInformation("Request fields: {Fields}", string.Join(", ", requestFields));
-
-                // If tools are present, log their size
-                if (root.TryGetProperty("tools", out var tools))
+                if (verbatim)
                 {
-                    var toolsJson = tools.GetRawText();
-                    logger.LogInformation("Tools field size: {Bytes} bytes, tool count: {Count}",
-                        toolsJson.Length, tools.GetArrayLength());
+                    // No format conversion, no field rewriting, no filtering. The body is
+                    // still Anthropic-shaped — the upstream's /v1/chat/completions must
+                    // tolerate that, or StripNonClaudeModels must be turned on.
+                    proxyReq.Content = new StringContent(bodyText, Encoding.UTF8, "application/json");
+                    proxyReq.Content.Headers.ContentType =
+                        new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+                    logger.LogWarning("StripNonClaudeModels off — forwarding Anthropic-shape body verbatim to {Endpoint}; enable StripNonClaudeModels if the upstream rejects it [model={Model}]",
+                        "/v1/chat/completions", model);
                 }
-
-                // Rewrite model field and filter out Anthropic-specific fields unsupported by local models
-                // metadata and context_management cause context bloat; cache_control is Anthropic-only
-                var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    { "model", "budget_tokens", "thinking", "metadata", "context_management" };
-
-                // For Qwen: skip tool_choice, system, and stream — all handled explicitly
-                // stream must be false for Qwen: Qwen2_5ResponseHandler expects plain JSON, not SSE
-                if (isQwen)
+                else
                 {
-                    fieldsToSkip.Add("tool_choice");
-                    fieldsToSkip.Add("system");
-                    fieldsToSkip.Add("stream");
-                }
-                var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    { "cache_control" };
+                    if (!modelRoute.StripNonClaudeModels && isQwen)
+                        logger.LogInformation("StripNonClaudeModels off but model is Qwen — running conversion pipeline anyway (Qwen response handler requires it)");
 
-                // Helper to recursively remove nested fields
-                void WriteElementWithoutNested(Utf8JsonWriter writer, JsonElement elem)
-                {
-                    switch (elem.ValueKind)
+                    using var bodyDoc = JsonDocument.Parse(bodyText);
+                    var root = bodyDoc.RootElement;
+
+                    // Log what fields are in the request
+                    var requestFields = new List<string>();
+                    foreach (var prop in root.EnumerateObject())
+                        requestFields.Add(prop.Name);
+                    logger.LogInformation("Request fields: {Fields}", string.Join(", ", requestFields));
+
+                    // If tools are present, log their size
+                    if (root.TryGetProperty("tools", out var tools))
                     {
-                        case JsonValueKind.Object:
-                            writer.WriteStartObject();
-                            foreach (var prop in elem.EnumerateObject())
-                            {
-                                if (!fieldsToRemoveNested.Contains(prop.Name))
-                                {
-                                    writer.WritePropertyName(prop.Name);
-                                    WriteElementWithoutNested(writer, prop.Value);
-                                }
-                            }
-                            writer.WriteEndObject();
-                            break;
-                        case JsonValueKind.Array:
-                            writer.WriteStartArray();
-                            foreach (var item in elem.EnumerateArray())
-                                WriteElementWithoutNested(writer, item);
-                            writer.WriteEndArray();
-                            break;
-                        default:
-                            elem.WriteTo(writer);
-                            break;
+                        var toolsJson = tools.GetRawText();
+                        logger.LogInformation("Tools field size: {Bytes} bytes, tool count: {Count}",
+                            toolsJson.Length, tools.GetArrayLength());
                     }
-                }
 
-                using var ms = new MemoryStream();
-                using (var w = new Utf8JsonWriter(ms))
-                {
-                    w.WriteStartObject();
-                    w.WriteString("model", model);
+                    // Rewrite model field and filter out Anthropic-specific fields unsupported by local models
+                    // metadata and context_management cause context bloat. cache_control is left in
+                    // place (not recursively stripped) — most OpenAI-compatible servers ignore unknown
+                    // fields; a strict upstream that rejects it needs cache_control disabled client-side.
+                    var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        { "model", "budget_tokens", "thinking", "metadata", "context_management" };
 
-                    logger.LogInformation("Request preprocessing for model: {Model}", model);
-
+                    // For Qwen: skip tool_choice, system, and stream — all rewritten explicitly below
+                    // stream must be false for Qwen: Qwen2_5ResponseHandler expects plain JSON, not SSE
                     if (isQwen)
                     {
-                        logger.LogInformation("Qwen: converting from Anthropic format to OpenAI chat format");
-                        // For Qwen, convert Anthropic Messages API to OpenAI chat format
-                        // System message becomes first message with role="system"
-                        w.WritePropertyName("messages");
-                        w.WriteStartArray();
-
-                        // Use a minimal fixed system prompt — discard CLAUDE.md and all Claude Code system blocks
+                        fieldsToSkip.Add("tool_choice");
+                        fieldsToSkip.Add("system");
+                        fieldsToSkip.Add("stream");
+                    }
+                    using var ms = new MemoryStream();
+                    using (var w = new Utf8JsonWriter(ms))
+                    {
                         w.WriteStartObject();
-                        w.WriteString("role", "system");
-                        w.WriteString("content", "You are a coding assistant. You MUST use tools to complete tasks. NEVER explain or describe what you would do — always call the appropriate tool immediately. If the user asks you to run a command, call Bash. If asked to read a file, call Read. Act, don't explain.");
-                        w.WriteEndObject();
-                        logger.LogInformation("Qwen: using minimal fixed system prompt");
+                        w.WriteString("model", model);
 
-                        // Add all messages — convert Anthropic format to OpenAI chat format
-                        if (root.TryGetProperty("messages", out var messagesField))
+                        logger.LogInformation("Request preprocessing for model: {Model}", model);
+
+                        if (isQwen)
                         {
-                            foreach (var msg in messagesField.EnumerateArray())
+                            logger.LogInformation("Qwen: converting from Anthropic format to OpenAI chat format");
+                            // For Qwen, convert Anthropic Messages API to OpenAI chat format
+                            // System message becomes first message with role="system"
+                            w.WritePropertyName("messages");
+                            w.WriteStartArray();
+
+                            // Use a minimal fixed system prompt — discard CLAUDE.md and all Claude Code system blocks
+                            w.WriteStartObject();
+                            w.WriteString("role", "system");
+                            w.WriteString("content", "You are a coding assistant. You MUST use tools to complete tasks. NEVER explain or describe what you would do — always call the appropriate tool immediately. If the user asks you to run a command, call Bash. If asked to read a file, call Read. Act, don't explain.");
+                            w.WriteEndObject();
+                            logger.LogInformation("Qwen: using minimal fixed system prompt");
+
+                            // Add all messages — convert Anthropic format to OpenAI chat format
+                            if (root.TryGetProperty("messages", out var messagesField))
                             {
-                                var roleStr = msg.TryGetProperty("role", out var roleElem) ? roleElem.GetString() ?? "" : "";
-
-                                if (msg.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+                                foreach (var msg in messagesField.EnumerateArray())
                                 {
-                                    var blocks = content.EnumerateArray().ToList();
-                                    var hasToolUse = roleStr == "assistant" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_use");
-                                    var hasToolResult = roleStr == "user" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_result");
+                                    var roleStr = msg.TryGetProperty("role", out var roleElem) ? roleElem.GetString() ?? "" : "";
 
-                                    if (hasToolUse)
+                                    if (msg.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
                                     {
-                                        // Convert Anthropic tool_use → OpenAI tool_calls
-                                        w.WriteStartObject();
-                                        w.WriteString("role", "assistant");
-                                        w.WriteNull("content");
-                                        w.WritePropertyName("tool_calls");
-                                        w.WriteStartArray();
-                                        foreach (var block in blocks)
+                                        var blocks = content.EnumerateArray().ToList();
+                                        var hasToolUse = roleStr == "assistant" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_use");
+                                        var hasToolResult = roleStr == "user" && blocks.Any(b => b.TryGetProperty("type", out var t) && t.GetString() == "tool_result");
+
+                                        if (hasToolUse)
                                         {
-                                            if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_use") continue;
-                                            var tid = block.TryGetProperty("id", out var idEl) ? idEl.GetString() : $"tool_{Guid.NewGuid():N}";
-                                            var tname = block.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : "";
-                                            var tinput = block.TryGetProperty("input", out var inputEl) ? inputEl.GetRawText() : "{}";
+                                            // Convert Anthropic tool_use → OpenAI tool_calls
                                             w.WriteStartObject();
-                                            w.WriteString("id", tid);
-                                            w.WriteString("type", "function");
-                                            w.WritePropertyName("function");
-                                            w.WriteStartObject();
-                                            w.WriteString("name", tname);
-                                            w.WriteString("arguments", tinput);
-                                            w.WriteEndObject();
+                                            w.WriteString("role", "assistant");
+                                            w.WriteNull("content");
+                                            w.WritePropertyName("tool_calls");
+                                            w.WriteStartArray();
+                                            foreach (var block in blocks)
+                                            {
+                                                if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_use") continue;
+                                                var tid = block.TryGetProperty("id", out var idEl) ? idEl.GetString() : $"tool_{Guid.NewGuid():N}";
+                                                var tname = block.TryGetProperty("name", out var nameEl) ? nameEl.GetString() : "";
+                                                var tinput = block.TryGetProperty("input", out var inputEl) ? inputEl.GetRawText() : "{}";
+                                                w.WriteStartObject();
+                                                w.WriteString("id", tid);
+                                                w.WriteString("type", "function");
+                                                w.WritePropertyName("function");
+                                                w.WriteStartObject();
+                                                w.WriteString("name", tname);
+                                                w.WriteString("arguments", tinput);
+                                                w.WriteEndObject();
+                                                w.WriteEndObject();
+                                            }
+                                            w.WriteEndArray();
                                             w.WriteEndObject();
                                         }
-                                        w.WriteEndArray();
-                                        w.WriteEndObject();
-                                    }
-                                    else if (hasToolResult)
-                                    {
-                                        // Convert Anthropic tool_result → OpenAI tool role messages (one per result)
-                                        foreach (var block in blocks)
+                                        else if (hasToolResult)
                                         {
-                                            if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_result") continue;
-                                            var callId = block.TryGetProperty("tool_use_id", out var cid) ? cid.GetString() ?? "" : "";
-                                            string resultText;
-                                            if (block.TryGetProperty("content", out var rc))
+                                            // Convert Anthropic tool_result → OpenAI tool role messages (one per result)
+                                            foreach (var block in blocks)
                                             {
-                                                if (rc.ValueKind == JsonValueKind.String)
+                                                if (!block.TryGetProperty("type", out var bt) || bt.GetString() != "tool_result") continue;
+                                                var callId = block.TryGetProperty("tool_use_id", out var cid) ? cid.GetString() ?? "" : "";
+                                                string resultText;
+                                                if (block.TryGetProperty("content", out var rc))
                                                 {
-                                                    resultText = await PersistedOutputResolver.ResolveAsync(rc.GetString() ?? "");
-                                                }
-                                                else if (rc.ValueKind == JsonValueKind.Array)
-                                                {
-                                                    // Extract text blocks, resolving any persisted-output in each
-                                                    var sb = new StringBuilder();
-                                                    foreach (var cb in rc.EnumerateArray())
+                                                    if (rc.ValueKind == JsonValueKind.String)
                                                     {
-                                                        if (cb.TryGetProperty("type", out var cbt) && cbt.GetString() == "text" &&
-                                                            cb.TryGetProperty("text", out var cbtxt))
-                                                            sb.Append(await PersistedOutputResolver.ResolveAsync(cbtxt.GetString() ?? ""));
+                                                        resultText = await PersistedOutputResolver.ResolveAsync(rc.GetString() ?? "");
                                                     }
-                                                    resultText = sb.ToString();
+                                                    else if (rc.ValueKind == JsonValueKind.Array)
+                                                    {
+                                                        // Extract text blocks, resolving any persisted-output in each
+                                                        var sb = new StringBuilder();
+                                                        foreach (var cb in rc.EnumerateArray())
+                                                        {
+                                                            if (cb.TryGetProperty("type", out var cbt) && cbt.GetString() == "text" &&
+                                                                cb.TryGetProperty("text", out var cbtxt))
+                                                                sb.Append(await PersistedOutputResolver.ResolveAsync(cbtxt.GetString() ?? ""));
+                                                        }
+                                                        resultText = sb.ToString();
+                                                    }
+                                                    else
+                                                    {
+                                                        resultText = rc.GetRawText();
+                                                    }
                                                 }
                                                 else
+                                                    resultText = "";
+                                                w.WriteStartObject();
+                                                w.WriteString("role", "tool");
+                                                w.WriteString("tool_call_id", callId);
+                                                w.WriteString("content", resultText);
+                                                w.WriteEndObject();
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // Regular message — filter noise, keep text blocks
+                                            w.WriteStartObject();
+                                            w.WriteString("role", roleStr);
+                                            w.WritePropertyName("content");
+                                            w.WriteStartArray();
+                                            foreach (var block in blocks)
+                                            {
+                                                if (block.TryGetProperty("type", out var bType) && bType.GetString() == "text"
+                                                    && block.TryGetProperty("text", out var bText))
                                                 {
-                                                    resultText = rc.GetRawText();
+                                                    var text = LocalLlmRequestFilter.StripInlineNoise(bText.GetString() ?? "");
+                                                    if (!LocalLlmRequestFilter.IsMessageNoise(text) && !string.IsNullOrWhiteSpace(text))
+                                                    {
+                                                        w.WriteStartObject();
+                                                        w.WriteString("type", "text");
+                                                        w.WriteString("text", text);
+                                                        w.WriteEndObject();
+                                                    }
                                                 }
                                             }
-                                            else
-                                                resultText = "";
-                                            w.WriteStartObject();
-                                            w.WriteString("role", "tool");
-                                            w.WriteString("tool_call_id", callId);
-                                            w.WriteString("content", resultText);
+                                            w.WriteEndArray();
                                             w.WriteEndObject();
                                         }
                                     }
-                                    else
+                                    else if (msg.TryGetProperty("content", out var contentStr) && contentStr.ValueKind == JsonValueKind.String)
                                     {
-                                        // Regular message — filter noise, keep text blocks
                                         w.WriteStartObject();
                                         w.WriteString("role", roleStr);
-                                        w.WritePropertyName("content");
-                                        w.WriteStartArray();
-                                        foreach (var block in blocks)
-                                        {
-                                            if (block.TryGetProperty("type", out var bType) && bType.GetString() == "text"
-                                                && block.TryGetProperty("text", out var bText))
-                                            {
-                                                var text = LocalLlmRequestFilter.StripInlineNoise(bText.GetString() ?? "");
-                                                if (!LocalLlmRequestFilter.IsMessageNoise(text) && !string.IsNullOrWhiteSpace(text))
-                                                {
-                                                    w.WriteStartObject();
-                                                    w.WriteString("type", "text");
-                                                    w.WriteString("text", text);
-                                                    w.WriteEndObject();
-                                                }
-                                            }
-                                        }
-                                        w.WriteEndArray();
+                                        w.WriteString("content", LocalLlmRequestFilter.StripInlineNoise(contentStr.GetString() ?? ""));
                                         w.WriteEndObject();
                                     }
                                 }
-                                else if (msg.TryGetProperty("content", out var contentStr) && contentStr.ValueKind == JsonValueKind.String)
+                            }
+
+                            w.WriteEndArray();
+
+                            // Add tools if present - convert from Anthropic to OpenAI format
+                            if (root.TryGetProperty("tools", out var toolsField) && toolsField.ValueKind == JsonValueKind.Array)
+                            {
+                                w.WritePropertyName("tools");
+                                w.WriteStartArray();
+
+                                var qwenToolCount = 0;
+                                var qwenSkippedCount = 0;
+                                foreach (var tool in toolsField.EnumerateArray())
                                 {
-                                    w.WriteStartObject();
-                                    w.WriteString("role", roleStr);
-                                    w.WriteString("content", LocalLlmRequestFilter.StripInlineNoise(contentStr.GetString() ?? ""));
-                                    w.WriteEndObject();
+                                    var toolName = tool.TryGetProperty("name", out var nameCheck) ? nameCheck.GetString() ?? "" : "";
+                                    if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpTools, modelRoute.BlockedMcpTools))
+                                    {
+                                        qwenSkippedCount++;
+                                        continue;
+                                    }
+
+                                    LocalLlmRequestFilter.WriteSlimTool(w, tool);
+                                    qwenToolCount++;
                                 }
+
+                                w.WriteEndArray(); // end tools array
+                                logger.LogInformation("✓ Qwen tools: {Included} included, {Skipped} skipped (IncludedTools filter + MCP filter)", qwenToolCount, qwenSkippedCount);
+                            }
+
+                            // Force tool_choice=required when tools are present — prevents Qwen from responding with text instead of calling tools
+                            var hasTools = root.TryGetProperty("tools", out var tc) && tc.ValueKind == JsonValueKind.Array && tc.GetArrayLength() > 0;
+                            w.WriteString("tool_choice", hasTools ? "required" : "none");
+
+                            // Force stream=false — Qwen2_5ResponseHandler expects plain JSON, not SSE
+                            w.WriteBoolean("stream", false);
+
+                            logger.LogInformation("✓ Converted to OpenAI chat format (stream=false)");
+                        }
+
+                        // Qwen: no top-level system — already written as messages[0] in the Qwen block above
+                        // Default (unknown models): pass through system field
+                        if (!isQwen)
+                        {
+                            if (root.TryGetProperty("system", out var sysMsg))
+                            {
+                                w.WritePropertyName("system");
+                                sysMsg.WriteTo(w);
                             }
                         }
 
-                        w.WriteEndArray();
-
-                        // Add tools if present - convert from Anthropic to OpenAI format
-                        if (root.TryGetProperty("tools", out var toolsField) && toolsField.ValueKind == JsonValueKind.Array)
+                        // Copy all other fields from original request, except unsupported ones
+                        // For messages, strip system-reminder tags to reduce token overhead
+                        // For tools, simplify to basic format (name, description, parameters only)
+                        var filteredFields = new List<string>();
+                        foreach (var prop in root.EnumerateObject())
                         {
-                            w.WritePropertyName("tools");
-                            w.WriteStartArray();
-
-                            var qwenToolCount = 0;
-                            var qwenSkippedCount = 0;
-                            foreach (var tool in toolsField.EnumerateArray())
+                            if (prop.Name.Equals("messages", StringComparison.OrdinalIgnoreCase))
                             {
-                                var toolName = tool.TryGetProperty("name", out var nameCheck) ? nameCheck.GetString() ?? "" : "";
-                                if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpTools, modelRoute.BlockedMcpTools))
+                                // Skip messages for Qwen - already written in Qwen block
+                                if (isQwen)
                                 {
-                                    qwenSkippedCount++;
+                                    logger.LogInformation("Qwen: Skipping messages field (already converted in Qwen block)");
                                     continue;
                                 }
 
-                                LocalLlmRequestFilter.WriteSlimTool(w, tool);
-                                qwenToolCount++;
-                            }
-
-                            w.WriteEndArray(); // end tools array
-                            logger.LogInformation("✓ Qwen tools: {Included} included, {Skipped} skipped (IncludedTools filter + MCP filter)", qwenToolCount, qwenSkippedCount);
-                        }
-
-                        // Force tool_choice=required when tools are present — prevents Qwen from responding with text instead of calling tools
-                        var hasTools = root.TryGetProperty("tools", out var tc) && tc.ValueKind == JsonValueKind.Array && tc.GetArrayLength() > 0;
-                        w.WriteString("tool_choice", hasTools ? "required" : "none");
-
-                        // Force stream=false — Qwen2_5ResponseHandler expects plain JSON, not SSE
-                        w.WriteBoolean("stream", false);
-
-                        logger.LogInformation("✓ Converted to OpenAI chat format (stream=false)");
-                    }
-
-                    // Qwen: no top-level system — already written as messages[0] in the Qwen block above
-                    // Default (unknown models): pass through system field
-                    if (!isQwen)
-                    {
-                        if (root.TryGetProperty("system", out var sysMsg))
-                        {
-                            w.WritePropertyName("system");
-                            sysMsg.WriteTo(w);
-                        }
-                    }
-
-                    // Copy all other fields from original request, except unsupported ones
-                    // For messages, strip system-reminder tags to reduce token overhead
-                    // For tools, simplify to basic format (name, description, parameters only)
-                    var filteredFields = new List<string>();
-                    foreach (var prop in root.EnumerateObject())
-                    {
-                        if (prop.Name.Equals("messages", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Skip messages for Qwen - already written in Qwen block
-                            if (isQwen)
-                            {
-                                logger.LogInformation("Qwen: Skipping messages field (already converted in Qwen block)");
-                                continue;
-                            }
-
-                            // Filter out system reminders from messages to save tokens
-                            w.WritePropertyName("messages");
-                            w.WriteStartArray();
-                            foreach (var msg in prop.Value.EnumerateArray())
-                            {
-                                w.WriteStartObject();
-                                if (msg.TryGetProperty("role", out var role)) { w.WritePropertyName("role"); role.WriteTo(w); }
-                                if (msg.TryGetProperty("content", out var content))
+                                // Filter out system reminders from messages to save tokens
+                                w.WritePropertyName("messages");
+                                w.WriteStartArray();
+                                foreach (var msg in prop.Value.EnumerateArray())
                                 {
-                                    w.WritePropertyName("content");
-                                    if (content.ValueKind == JsonValueKind.String)
+                                    w.WriteStartObject();
+                                    if (msg.TryGetProperty("role", out var role)) { w.WritePropertyName("role"); role.WriteTo(w); }
+                                    if (msg.TryGetProperty("content", out var content))
                                     {
-                                        var text = content.GetString() ?? "";
-                                        // Strip system reminders
-                                        text = System.Text.RegularExpressions.Regex.Replace(text, @"<system-reminder>.*?</system-reminder>\n*", "", System.Text.RegularExpressions.RegexOptions.Singleline);
-                                        w.WriteStringValue(text);
-                                    }
-                                    else if (content.ValueKind == JsonValueKind.Array)
-                                    {
-                                        // Content is array of blocks, filter out system-reminder text blocks
-                                        w.WriteStartArray();
-                                        foreach (var block in content.EnumerateArray())
+                                        w.WritePropertyName("content");
+                                        if (content.ValueKind == JsonValueKind.String)
                                         {
-                                            if (block.TryGetProperty("type", out var type) && type.GetString() == "text" && block.TryGetProperty("text", out var txt))
+                                            var text = content.GetString() ?? "";
+                                            // Strip system reminders
+                                            text = System.Text.RegularExpressions.Regex.Replace(text, @"<system-reminder>.*?</system-reminder>\n*", "", System.Text.RegularExpressions.RegexOptions.Singleline);
+                                            w.WriteStringValue(text);
+                                        }
+                                        else if (content.ValueKind == JsonValueKind.Array)
+                                        {
+                                            // Content is array of blocks, filter out system-reminder text blocks
+                                            w.WriteStartArray();
+                                            foreach (var block in content.EnumerateArray())
                                             {
-                                                var text = txt.GetString() ?? "";
-                                                if (!text.Contains("<system-reminder>"))
+                                                if (block.TryGetProperty("type", out var type) && type.GetString() == "text" && block.TryGetProperty("text", out var txt))
+                                                {
+                                                    var text = txt.GetString() ?? "";
+                                                    if (!text.Contains("<system-reminder>"))
+                                                    {
+                                                        block.WriteTo(w);
+                                                    }
+                                                }
+                                                else
                                                 {
                                                     block.WriteTo(w);
                                                 }
                                             }
-                                            else
-                                            {
-                                                block.WriteTo(w);
-                                            }
+                                            w.WriteEndArray();
                                         }
-                                        w.WriteEndArray();
+                                        else
+                                        {
+                                            content.WriteTo(w);
+                                        }
                                     }
-                                    else
-                                    {
-                                        content.WriteTo(w);
-                                    }
+                                    w.WriteEndObject();
                                 }
-                                w.WriteEndObject();
+                                w.WriteEndArray();
                             }
-                            w.WriteEndArray();
-                        }
-                        else if (prop.Name.Equals("tools", StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (isQwen)
+                            else if (prop.Name.Equals("tools", StringComparison.OrdinalIgnoreCase))
                             {
-                                // Qwen: tools already written in Qwen block, skip
+                                if (isQwen)
+                                {
+                                    // Qwen: tools already written in Qwen block, skip
+                                }
+                                else
+                                {
+                                    // Default: keep tools
+                                    w.WritePropertyName("tools");
+                                    prop.Value.WriteTo(w);
+                                }
+                            }
+                            else if (!fieldsToSkip.Contains(prop.Name))
+                            {
+                                w.WritePropertyName(prop.Name);
+                                prop.Value.WriteTo(w);
                             }
                             else
                             {
-                                // Default: keep tools
-                                w.WritePropertyName("tools");
-                                prop.Value.WriteTo(w);
+                                filteredFields.Add(prop.Name);
                             }
                         }
-                        else if (!fieldsToSkip.Contains(prop.Name))
-                        {
-                            w.WritePropertyName(prop.Name);
-                            WriteElementWithoutNested(w, prop.Value);
-                        }
-                        else
-                        {
-                            filteredFields.Add(prop.Name);
-                        }
+                        w.WriteEndObject();
+
+                        if (filteredFields.Count > 0)
+                            logger.LogInformation("Filtered out unsupported fields: {Fields}", string.Join(", ", filteredFields));
                     }
-                    w.WriteEndObject();
 
-                    if (filteredFields.Count > 0)
-                        logger.LogInformation("Filtered out unsupported fields: {Fields}", string.Join(", ", filteredFields));
+                    var payload = ms.ToArray();
+                    proxyReq.Content = new ByteArrayContent(payload);
+                    proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+
+                    logger.LogInformation("Forwarding to LLM /v1/chat/completions: model={Model}", model);
                 }
-
-                var payload = ms.ToArray();
-                proxyReq.Content = new ByteArrayContent(payload);
-                proxyReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
-
-                logger.LogInformation("Forwarding to LLM /v1/chat/completions: model={Model}", model);
             }
 
             var responseBuffering = context.Features
@@ -688,11 +712,24 @@ try
 
                 logger.LogInformation("Starting response handling");
 
-                // Resolve and use the appropriate handler for the target model
-                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
-                await handler.HandleResponseAsync(context, lmResp, model!, logger);
+                if (verbatim)
+                {
+                    // Verbatim mode: stream the upstream response straight back, untouched.
+                    if (lmResp.Content.Headers.ContentType is not null)
+                        context.Response.ContentType = lmResp.Content.Headers.ContentType.ToString();
+                    await using var verbatimStream = await lmResp.Content.ReadAsStreamAsync(context.RequestAborted);
+                    await verbatimStream.CopyToAsync(context.Response.Body, context.RequestAborted);
+                    await context.Response.Body.FlushAsync(context.RequestAborted);
+                    logger.LogInformation("<- 200 POST {Path} [LLM verbatim passthrough]", req.Path);
+                }
+                else
+                {
+                    // Resolve and use the appropriate handler for the target model
+                    var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
+                    await handler.HandleResponseAsync(context, lmResp, model!, logger);
 
-                logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
+                    logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
+                }
             }
             catch (HttpRequestException ex)
             {
@@ -1001,6 +1038,7 @@ try
         {
             settings.Enabled,
             settings.ApiFormat,
+            settings.StripNonClaudeModels,
             Target = llmUrl
         });
     })
@@ -1014,11 +1052,13 @@ try
         var settings = cache.Get<ModelRouteSettings>("model_route_settings") ?? new ModelRouteSettings();
         if (body.Enabled.HasValue) settings.Enabled = body.Enabled.Value;
         if (body.ApiFormat is not null) settings.ApiFormat = body.ApiFormat;
+        if (body.StripNonClaudeModels.HasValue) settings.StripNonClaudeModels = body.StripNonClaudeModels.Value;
         cache.Set("model_route_settings", settings);
         return Results.Ok(new
         {
             settings.Enabled,
             settings.ApiFormat,
+            settings.StripNonClaudeModels,
             Target = llmUrl
         });
     })
@@ -1029,8 +1069,15 @@ try
 
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
-        cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, ApiFormat = "anthropic" });
+        var defaults = new ModelRouteSettings();
+        cache.Set("model_route_settings", defaults);
+        return Results.Ok(new
+        {
+            status = "model routing reset to defaults",
+            defaults.Enabled,
+            defaults.ApiFormat,
+            defaults.StripNonClaudeModels
+        });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
@@ -1092,6 +1139,31 @@ static (string? email, string? name) TryDecodeJwt(string token, MEL.ILogger logg
     {
         logger.LogWarning(ex, "JWT decode failed");
         return (null, null);
+    }
+}
+
+static bool ContainsCacheControlProperty(JsonElement element)
+{
+    switch (element.ValueKind)
+    {
+        case JsonValueKind.Object:
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (prop.NameEquals("cache_control"))
+                    return true;
+                if (ContainsCacheControlProperty(prop.Value))
+                    return true;
+            }
+            return false;
+        case JsonValueKind.Array:
+            foreach (var item in element.EnumerateArray())
+            {
+                if (ContainsCacheControlProperty(item))
+                    return true;
+            }
+            return false;
+        default:
+            return false;
     }
 }
 
@@ -1271,12 +1343,18 @@ public class ModelRouteSettings
     public List<string> AllowedMcpTools { get; set; } = new();
     /// <summary>Exact MCP tool names to block even if matched by AllowedMcpTools.</summary>
     public List<string> BlockedMcpTools { get; set; } = new();
+    /// <summary>Gates the entire OpenAI-format request preprocessing. Off (default): the body is
+    /// forwarded byte-for-byte — no conversion, rewriting, or filtering of any kind. On: the full
+    /// Anthropic→OpenAI conversion + slimming pipeline (field drops, system-reminder/noise filters,
+    /// Qwen system prompt replacement, tool filters) runs as before.</summary>
+    public bool StripNonClaudeModels { get; set; } = false;
 }
 
 public class ModelRouteRequest
 {
     public bool? Enabled { get; set; }
     public string? ApiFormat { get; set; }
+    public bool? StripNonClaudeModels { get; set; }
 }
 
 /// <summary>
