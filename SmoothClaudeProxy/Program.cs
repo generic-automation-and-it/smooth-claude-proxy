@@ -99,8 +99,7 @@ try
         IncludedTools = llmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
         AllowedMcpTools = llmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
         BlockedMcpTools = llmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new(),
-        StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels",
-            llmConfig.GetValue("strip-non-claude-models", false))
+        StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels", false)
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -233,29 +232,36 @@ try
                 req.Body.Position = 0;
                 using var ptReader = new StreamReader(req.Body, leaveOpen: true);
                 var ptBody = await ptReader.ReadToEndAsync();
-                if (!ptBody.Contains("\"cache_control\"", StringComparison.Ordinal))
+                try
                 {
-                    try
+                    using var ptDoc = JsonDocument.Parse(ptBody);
+                    // Substring scan is a fast negative check only; it can false-positive on
+                    // prompt text that mentions cache_control, so confirm structurally.
+                    var hasCacheControl = ptBody.Contains("\"cache_control\"", StringComparison.Ordinal)
+                        && ContainsCacheControlProperty(ptDoc.RootElement);
+                    if (!hasCacheControl && ptDoc.RootElement.ValueKind == JsonValueKind.Object)
                     {
-                        using var ptDoc = JsonDocument.Parse(ptBody);
                         using var ptMs = new MemoryStream();
                         using (var ptWriter = new Utf8JsonWriter(ptMs))
                         {
+                            // Append after the original properties to keep their order intact.
                             ptWriter.WriteStartObject();
+                            foreach (var prop in ptDoc.RootElement.EnumerateObject())
+                                prop.WriteTo(ptWriter);
                             ptWriter.WritePropertyName("cache_control");
                             ptWriter.WriteStartObject();
                             ptWriter.WriteString("type", "ephemeral");
                             ptWriter.WriteEndObject();
-                            foreach (var prop in ptDoc.RootElement.EnumerateObject())
-                                prop.WriteTo(ptWriter);
                             ptWriter.WriteEndObject();
                         }
                         ptBody = Encoding.UTF8.GetString(ptMs.ToArray());
                         logger.LogInformation("Injected top-level cache_control (ephemeral) — request had none");
                     }
-                    catch (JsonException) { /* non-object body — forward unchanged */ }
                 }
+                catch (JsonException) { /* non-JSON body — forward unchanged */ }
                 ptReq.Content = new StringContent(ptBody, Encoding.UTF8, "application/json");
+                ptReq.Content.Headers.ContentType =
+                    new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
 
                 logger.LogInformation("LLM passthrough -> {Url} [model={Model}]", ptUrl, model ?? "-");
 
@@ -320,6 +326,11 @@ try
             using var proxyReq = new HttpRequestMessage(HttpMethod.Post, targetUrl);
             proxyReq.Headers.TryAddWithoutValidation("Authorization", $"Bearer {llmToken}");
 
+            // StripNonClaudeModels off (default): forward the body verbatim and stream the
+            // response straight back. Qwen always runs the conversion pipeline regardless —
+            // Qwen2_5ResponseHandler requires the converted non-stream flow.
+            var verbatim = !modelRoute.StripNonClaudeModels && !isQwen;
+
             // Convert and forward request to the configured LLM
             if (req.ContentLength > 0 || req.ContentType is not null)
             {
@@ -328,16 +339,22 @@ try
                 var bodyText = await bodyReader.ReadToEndAsync();
                 logger.LogInformation("Original request body size: {Bytes} bytes", bodyText.Length);
 
-                if (!modelRoute.StripNonClaudeModels)
+                if (verbatim)
                 {
-                    // StripNonClaudeModels off (default): make no changes at all — forward the
-                    // request body byte-for-byte. No format conversion, no field rewriting,
-                    // no filtering. Turn the setting on to enable the slimming/conversion below.
+                    // No format conversion, no field rewriting, no filtering. The body is
+                    // still Anthropic-shaped — the upstream's /v1/chat/completions must
+                    // tolerate that, or StripNonClaudeModels must be turned on.
                     proxyReq.Content = new StringContent(bodyText, Encoding.UTF8, "application/json");
-                    logger.LogInformation("StripNonClaudeModels off — forwarding request body verbatim [model={Model}]", model);
+                    proxyReq.Content.Headers.ContentType =
+                        new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+                    logger.LogWarning("StripNonClaudeModels off — forwarding Anthropic-shape body verbatim to {Endpoint}; enable StripNonClaudeModels if the upstream rejects it [model={Model}]",
+                        "/v1/chat/completions", model);
                 }
                 else
                 {
+                    if (!modelRoute.StripNonClaudeModels && isQwen)
+                        logger.LogInformation("StripNonClaudeModels off but model is Qwen — running conversion pipeline anyway (Qwen response handler requires it)");
+
                     using var bodyDoc = JsonDocument.Parse(bodyText);
                     var root = bodyDoc.RootElement;
 
@@ -356,8 +373,9 @@ try
                     }
 
                     // Rewrite model field and filter out Anthropic-specific fields unsupported by local models
-                    // metadata and context_management cause context bloat. cache_control is
-                    // forwarded as-is — anthropic-compatible upstreams use it for prompt caching.
+                    // metadata and context_management cause context bloat. cache_control is left in
+                    // place (not recursively stripped) — most OpenAI-compatible servers ignore unknown
+                    // fields; a strict upstream that rejects it needs cache_control disabled client-side.
                     var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                         { "model", "budget_tokens", "thinking", "metadata", "context_management" };
 
@@ -694,11 +712,24 @@ try
 
                 logger.LogInformation("Starting response handling");
 
-                // Resolve and use the appropriate handler for the target model
-                var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
-                await handler.HandleResponseAsync(context, lmResp, model!, logger);
+                if (verbatim)
+                {
+                    // Verbatim mode: stream the upstream response straight back, untouched.
+                    if (lmResp.Content.Headers.ContentType is not null)
+                        context.Response.ContentType = lmResp.Content.Headers.ContentType.ToString();
+                    await using var verbatimStream = await lmResp.Content.ReadAsStreamAsync(context.RequestAborted);
+                    await verbatimStream.CopyToAsync(context.Response.Body, context.RequestAborted);
+                    await context.Response.Body.FlushAsync(context.RequestAborted);
+                    logger.LogInformation("<- 200 POST {Path} [LLM verbatim passthrough]", req.Path);
+                }
+                else
+                {
+                    // Resolve and use the appropriate handler for the target model
+                    var handler = context.RequestServices.GetRequiredKeyedService<ILocalLLMResponseHandler>(model!);
+                    await handler.HandleResponseAsync(context, lmResp, model!, logger);
 
-                logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
+                    logger.LogInformation("<- 200 POST {Path} [LLM via /api/v1/chat] translated to Anthropic SSE", req.Path);
+                }
             }
             catch (HttpRequestException ex)
             {
@@ -1038,8 +1069,15 @@ try
 
     app.MapDelete("/override-model", (IMemoryCache cache) =>
     {
-        cache.Set("model_route_settings", new ModelRouteSettings());
-        return Results.Ok(new { status = "model routing reset to defaults", Enabled = true, ApiFormat = "anthropic" });
+        var defaults = new ModelRouteSettings();
+        cache.Set("model_route_settings", defaults);
+        return Results.Ok(new
+        {
+            status = "model routing reset to defaults",
+            defaults.Enabled,
+            defaults.ApiFormat,
+            defaults.StripNonClaudeModels
+        });
     })
         .WithName("ResetModelRoute")
         .WithSummary("Reset model routing to defaults")
@@ -1101,6 +1139,31 @@ static (string? email, string? name) TryDecodeJwt(string token, MEL.ILogger logg
     {
         logger.LogWarning(ex, "JWT decode failed");
         return (null, null);
+    }
+}
+
+static bool ContainsCacheControlProperty(JsonElement element)
+{
+    switch (element.ValueKind)
+    {
+        case JsonValueKind.Object:
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (prop.NameEquals("cache_control"))
+                    return true;
+                if (ContainsCacheControlProperty(prop.Value))
+                    return true;
+            }
+            return false;
+        case JsonValueKind.Array:
+            foreach (var item in element.EnumerateArray())
+            {
+                if (ContainsCacheControlProperty(item))
+                    return true;
+            }
+            return false;
+        default:
+            return false;
     }
 }
 
