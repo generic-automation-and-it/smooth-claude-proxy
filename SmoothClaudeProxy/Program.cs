@@ -223,13 +223,37 @@ try
                 ptReq.Headers.TryAddWithoutValidation("anthropic-version", anthropicVersion ?? "2023-06-01");
                 ptReq.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
 
-                // Forward the body verbatim — model field stays as-is.
+                // Forward the body as-is — model field stays untouched. If the client set
+                // cache_control anywhere (block-level or top-level), it passes through
+                // unchanged. If the request has none at all, inject a top-level
+                // cache_control so anthropic-compatible upstreams (e.g. MiniMax) enable
+                // prompt caching automatically.
                 req.Body.Position = 0;
-                using var ptBodyStream = new MemoryStream();
-                await req.Body.CopyToAsync(ptBodyStream);
-                ptBodyStream.Position = 0;
-                ptReq.Content = new StreamContent(ptBodyStream);
-                ptReq.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+                using var ptReader = new StreamReader(req.Body, leaveOpen: true);
+                var ptBody = await ptReader.ReadToEndAsync();
+                if (!ptBody.Contains("\"cache_control\"", StringComparison.Ordinal))
+                {
+                    try
+                    {
+                        using var ptDoc = JsonDocument.Parse(ptBody);
+                        using var ptMs = new MemoryStream();
+                        using (var ptWriter = new Utf8JsonWriter(ptMs))
+                        {
+                            ptWriter.WriteStartObject();
+                            ptWriter.WritePropertyName("cache_control");
+                            ptWriter.WriteStartObject();
+                            ptWriter.WriteString("type", "ephemeral");
+                            ptWriter.WriteEndObject();
+                            foreach (var prop in ptDoc.RootElement.EnumerateObject())
+                                prop.WriteTo(ptWriter);
+                            ptWriter.WriteEndObject();
+                        }
+                        ptBody = Encoding.UTF8.GetString(ptMs.ToArray());
+                        logger.LogInformation("Injected top-level cache_control (ephemeral) — request had none");
+                    }
+                    catch (JsonException) { /* non-object body — forward unchanged */ }
+                }
+                ptReq.Content = new StringContent(ptBody, Encoding.UTF8, "application/json");
 
                 logger.LogInformation("LLM passthrough -> {Url} [model={Model}]", ptUrl, model ?? "-");
 
@@ -320,7 +344,8 @@ try
                 }
 
                 // Rewrite model field and filter out Anthropic-specific fields unsupported by local models
-                // metadata and context_management cause context bloat; cache_control is Anthropic-only
+                // metadata and context_management cause context bloat. cache_control is
+                // forwarded as-is — anthropic-compatible upstreams use it for prompt caching.
                 var fieldsToSkip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                     { "model", "budget_tokens", "thinking", "metadata", "context_management" };
 
@@ -332,38 +357,6 @@ try
                     fieldsToSkip.Add("system");
                     fieldsToSkip.Add("stream");
                 }
-                var fieldsToRemoveNested = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                    { "cache_control" };
-
-                // Helper to recursively remove nested fields
-                void WriteElementWithoutNested(Utf8JsonWriter writer, JsonElement elem)
-                {
-                    switch (elem.ValueKind)
-                    {
-                        case JsonValueKind.Object:
-                            writer.WriteStartObject();
-                            foreach (var prop in elem.EnumerateObject())
-                            {
-                                if (!fieldsToRemoveNested.Contains(prop.Name))
-                                {
-                                    writer.WritePropertyName(prop.Name);
-                                    WriteElementWithoutNested(writer, prop.Value);
-                                }
-                            }
-                            writer.WriteEndObject();
-                            break;
-                        case JsonValueKind.Array:
-                            writer.WriteStartArray();
-                            foreach (var item in elem.EnumerateArray())
-                                WriteElementWithoutNested(writer, item);
-                            writer.WriteEndArray();
-                            break;
-                        default:
-                            elem.WriteTo(writer);
-                            break;
-                    }
-                }
-
                 using var ms = new MemoryStream();
                 using (var w = new Utf8JsonWriter(ms))
                 {
@@ -629,7 +622,7 @@ try
                         else if (!fieldsToSkip.Contains(prop.Name))
                         {
                             w.WritePropertyName(prop.Name);
-                            WriteElementWithoutNested(w, prop.Value);
+                            prop.Value.WriteTo(w);
                         }
                         else
                         {
