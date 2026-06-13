@@ -28,10 +28,12 @@ env:
   MAJOR_MINOR: "1.0"
 
 jobs:
+  # Container image -> GHCR. Independent of the binary job so a flaky base-image
+  # pull from MCR can't block the release asset.
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
 
     steps:
@@ -74,12 +76,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ---- Self-contained binary for runtimes without a container engine ----
+  # Self-contained linux-x64 binary -> GitHub Release asset, for hosts without a
+  # container engine. Runs in parallel with (and independent of) the image build.
+  publish-binary:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+
+      - name: Compute version (1.0.<run_number>)
+        id: version
+        run: echo "version=${MAJOR_MINOR}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
       - name: Publish self-contained linux-x64 binary
         run: |
