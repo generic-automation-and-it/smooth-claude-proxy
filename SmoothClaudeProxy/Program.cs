@@ -97,10 +97,10 @@ try
         Enabled = llmConfig.GetValue("Enabled", true),
         ApiFormat = llmConfig.GetValue("ApiFormat", "anthropic")!,
         StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels", false),
-        FableModel = llmConfig.GetValue<string>("claude-fable-default-model"),
-        OpusModel = llmConfig.GetValue<string>("claude-opus-default-model"),
-        SonnetModel = llmConfig.GetValue<string>("claude-sonnet-default-model"),
-        HaikuModel = llmConfig.GetValue<string>("claude-haiku-default-model")
+        FableModel = llmConfig.GetValue<string>("claude_fable_default_model"),
+        OpusModel = llmConfig.GetValue<string>("claude_opus_default_model"),
+        SonnetModel = llmConfig.GetValue<string>("claude_sonnet_default_model"),
+        HaikuModel = llmConfig.GetValue<string>("claude_haiku_default_model")
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
