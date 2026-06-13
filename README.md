@@ -79,6 +79,23 @@ docker run -d --name claude-proxy \
 
 Images are published by the **Publish container** GitHub Action. Versioning is fixed at major.minor `1.0` with the patch number set to the Actions run number, so each run publishes a new immutable `1.0.<run_number>` tag (e.g. `1.0.3`) and re-points the `1.0`, `1`, and `latest` tags at the newest image. Pin `1.0.<run_number>` for a reproducible pull, or use `latest`/`1` to always get the newest.
 
+### Run without a container runtime (self-contained binary)
+
+For hosts that have no Docker/Podman (e.g. a Vercel sandbox), the same workflow attaches a self-contained `linux-x64` binary to each GitHub Release. It bundles the .NET runtime, so no SDK is required:
+
+```bash
+sudo mkdir -p /opt/claude-proxy
+curl -fsSL https://github.com/generic-automation-and-it/smooth-claude-proxy/releases/latest/download/smooth-claude-proxy-linux-x64.tar.gz \
+  | sudo tar xz -C /opt/claude-proxy
+
+ASPNETCORE_URLS=http://+:5066 \
+WORKSPACE_PATH=$HOME/.claude/proxy \
+OPENCODE_API_KEY="$OPENCODE_API_KEY" \
+  /opt/claude-proxy/SmoothClaudeProxy
+```
+
+`ASPNETCORE_URLS` replaces the container's `-p 5066:5066`; `WORKSPACE_PATH` replaces the `-v ~/.claude/proxy:/data` mount (point it straight at a host dir).
+
 ### Docker Compose
 
 ```bash
