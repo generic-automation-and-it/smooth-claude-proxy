@@ -96,10 +96,11 @@ try
     {
         Enabled = llmConfig.GetValue("Enabled", true),
         ApiFormat = llmConfig.GetValue("ApiFormat", "anthropic")!,
-        IncludedTools = llmConfig.GetSection("IncludedTools").Get<List<string>>() ?? new(),
-        AllowedMcpTools = llmConfig.GetSection("AllowedMcpTools").Get<List<string>>() ?? new(),
-        BlockedMcpTools = llmConfig.GetSection("BlockedMcpTools").Get<List<string>>() ?? new(),
-        StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels", false)
+        StripNonClaudeModels = llmConfig.GetValue("StripNonClaudeModels", false),
+        FableModel = llmConfig.GetValue<string>("claude-fable-default-model"),
+        OpusModel = llmConfig.GetValue<string>("claude-opus-default-model"),
+        SonnetModel = llmConfig.GetValue<string>("claude-sonnet-default-model"),
+        HaikuModel = llmConfig.GetValue<string>("claude-haiku-default-model")
     };
     startupCache.Set("model_route_settings", modelRouteDefaults);
 
@@ -195,8 +196,19 @@ try
                 parts.Length >= 2 ? "JWT (header.payload.signature)" : "opaque token");
         }
 
+        // Per-family model override: if the inbound claude-* model matches a configured family
+        // prefix and that override is non-empty, swap the model and force LLM routing.
+        var originalModel = model;
+        var overrideModel = modelRoute.Enabled ? ResolveModelOverride(model, modelRoute) : null;
+        if (overrideModel is not null)
+        {
+            logger.LogInformation("Model override: {Original} -> {Override} (routing to LLM)", originalModel, overrideModel);
+            model = overrideModel;
+        }
+
         var routesToAnthropic = model?.StartsWith("claude-", StringComparison.OrdinalIgnoreCase) == true;
-        var isLlmRoute = modelRoute.Enabled && !string.IsNullOrWhiteSpace(model) && !routesToAnthropic;
+        var isLlmRoute = modelRoute.Enabled && !string.IsNullOrWhiteSpace(model)
+            && (!routesToAnthropic || overrideModel is not null);
         var routeTarget = isLlmRoute ? "OpenCode" : "Anthropic";
 
         logger.LogInformation("-> {Method} {Path}{Query} [auth={AuthType}, model={Model}, route={Route}]",
@@ -239,7 +251,8 @@ try
                     // prompt text that mentions cache_control, so confirm structurally.
                     var hasCacheControl = ptBody.Contains("\"cache_control\"", StringComparison.Ordinal)
                         && ContainsCacheControlProperty(ptDoc.RootElement);
-                    if (!hasCacheControl && ptDoc.RootElement.ValueKind == JsonValueKind.Object)
+                    var needsModelSwap = overrideModel is not null;
+                    if (ptDoc.RootElement.ValueKind == JsonValueKind.Object && (needsModelSwap || !hasCacheControl))
                     {
                         using var ptMs = new MemoryStream();
                         using (var ptWriter = new Utf8JsonWriter(ptMs))
@@ -247,15 +260,26 @@ try
                             // Append after the original properties to keep their order intact.
                             ptWriter.WriteStartObject();
                             foreach (var prop in ptDoc.RootElement.EnumerateObject())
-                                prop.WriteTo(ptWriter);
-                            ptWriter.WritePropertyName("cache_control");
-                            ptWriter.WriteStartObject();
-                            ptWriter.WriteString("type", "ephemeral");
-                            ptWriter.WriteEndObject();
+                            {
+                                if (needsModelSwap && prop.NameEquals("model"))
+                                    ptWriter.WriteString("model", model);
+                                else
+                                    prop.WriteTo(ptWriter);
+                            }
+                            if (!hasCacheControl)
+                            {
+                                ptWriter.WritePropertyName("cache_control");
+                                ptWriter.WriteStartObject();
+                                ptWriter.WriteString("type", "ephemeral");
+                                ptWriter.WriteEndObject();
+                            }
                             ptWriter.WriteEndObject();
                         }
                         ptBody = Encoding.UTF8.GetString(ptMs.ToArray());
-                        logger.LogInformation("Injected top-level cache_control (ephemeral) — request had none");
+                        if (needsModelSwap)
+                            logger.LogInformation("Passthrough model swapped {Original} -> {Model}", originalModel, model);
+                        if (!hasCacheControl)
+                            logger.LogInformation("Injected top-level cache_control (ephemeral) — request had none");
                     }
                 }
                 catch (JsonException) { /* non-JSON body — forward unchanged */ }
@@ -341,9 +365,15 @@ try
 
                 if (verbatim)
                 {
-                    // No format conversion, no field rewriting, no filtering. The body is
+                    // No format conversion, no field rewriting, no filtering — except the
+                    // per-family model swap, which must reach the upstream. The body is
                     // still Anthropic-shaped — the upstream's /v1/chat/completions must
                     // tolerate that, or StripNonClaudeModels must be turned on.
+                    if (overrideModel is not null)
+                    {
+                        bodyText = RewriteModelField(bodyText, model!);
+                        logger.LogInformation("Verbatim model swapped {Original} -> {Model}", originalModel, model);
+                    }
                     proxyReq.Content = new StringContent(bodyText, Encoding.UTF8, "application/json");
                     proxyReq.Content.Headers.ContentType =
                         new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
@@ -535,22 +565,14 @@ try
                                 w.WriteStartArray();
 
                                 var qwenToolCount = 0;
-                                var qwenSkippedCount = 0;
                                 foreach (var tool in toolsField.EnumerateArray())
                                 {
-                                    var toolName = tool.TryGetProperty("name", out var nameCheck) ? nameCheck.GetString() ?? "" : "";
-                                    if (!LocalLlmToolFilter.IsAllowed(toolName, modelRoute.IncludedTools, modelRoute.AllowedMcpTools, modelRoute.BlockedMcpTools))
-                                    {
-                                        qwenSkippedCount++;
-                                        continue;
-                                    }
-
                                     LocalLlmRequestFilter.WriteSlimTool(w, tool);
                                     qwenToolCount++;
                                 }
 
                                 w.WriteEndArray(); // end tools array
-                                logger.LogInformation("✓ Qwen tools: {Included} included, {Skipped} skipped (IncludedTools filter + MCP filter)", qwenToolCount, qwenSkippedCount);
+                                logger.LogInformation("✓ Qwen tools: {Included} included", qwenToolCount);
                             }
 
                             // Force tool_choice=required when tools are present — prevents Qwen from responding with text instead of calling tools
@@ -1056,6 +1078,10 @@ try
             settings.Enabled,
             settings.ApiFormat,
             settings.StripNonClaudeModels,
+            settings.FableModel,
+            settings.OpusModel,
+            settings.SonnetModel,
+            settings.HaikuModel,
             Target = llmUrl
         });
     })
@@ -1156,6 +1182,54 @@ static (string? email, string? name) TryDecodeJwt(string token, MEL.ILogger logg
     {
         logger.LogWarning(ex, "JWT decode failed");
         return (null, null);
+    }
+}
+
+// Returns the configured override model for a given inbound model, or null if no family
+// prefix matches or the matching override is empty. Family prefixes are matched
+// case-insensitively (claude-fable, claude-opus, claude-sonnet, claude-haiku).
+static string? ResolveModelOverride(string? model, ModelRouteSettings s)
+{
+    if (string.IsNullOrWhiteSpace(model)) return null;
+
+    if (model.StartsWith("claude-fable", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.FableModel))
+        return s.FableModel;
+    if (model.StartsWith("claude-opus", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.OpusModel))
+        return s.OpusModel;
+    if (model.StartsWith("claude-sonnet", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.SonnetModel))
+        return s.SonnetModel;
+    if (model.StartsWith("claude-haiku", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(s.HaikuModel))
+        return s.HaikuModel;
+
+    return null;
+}
+
+// Rewrites the top-level "model" property of a JSON object body, preserving key order.
+// Non-object bodies (or unparseable JSON) are returned unchanged.
+static string RewriteModelField(string body, string newModel)
+{
+    try
+    {
+        using var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.ValueKind != JsonValueKind.Object) return body;
+        using var ms = new MemoryStream();
+        using (var w = new Utf8JsonWriter(ms))
+        {
+            w.WriteStartObject();
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (prop.NameEquals("model"))
+                    w.WriteString("model", newModel);
+                else
+                    prop.WriteTo(w);
+            }
+            w.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+    catch (JsonException)
+    {
+        return body;
     }
 }
 
@@ -1359,17 +1433,20 @@ public class ModelRouteSettings
     /// <summary>Upstream API shape: "anthropic" = pure passthrough to a /v1/messages endpoint (no conversion);
     /// "openai" = convert to OpenAI chat format and back (OpenAI-compatible LLM path).</summary>
     public string ApiFormat { get; set; } = "anthropic";
-    /// <summary>Built-in tools to include when forwarding to the configured LLM. Empty = allow all non-MCP tools.</summary>
-    public List<string> IncludedTools { get; set; } = new();
-    /// <summary>MCP tool name prefixes to allow for the configured LLM (starts-with, case-insensitive). Empty = no MCP tools.</summary>
-    public List<string> AllowedMcpTools { get; set; } = new();
-    /// <summary>Exact MCP tool names to block even if matched by AllowedMcpTools.</summary>
-    public List<string> BlockedMcpTools { get; set; } = new();
     /// <summary>Gates the entire OpenAI-format request preprocessing. Off (default): the body is
     /// forwarded byte-for-byte — no conversion, rewriting, or filtering of any kind. On: the full
     /// Anthropic→OpenAI conversion + slimming pipeline (field drops, system-reminder/noise filters,
-    /// Qwen system prompt replacement, tool filters) runs as before.</summary>
+    /// Qwen system prompt replacement) runs as before.</summary>
     public bool StripNonClaudeModels { get; set; } = false;
+
+    /// <summary>Per-family model overrides. When the inbound model starts with the family prefix
+    /// (e.g. "claude-fable") and the override is non-empty, the request is routed to the configured
+    /// LLM upstream instead of Anthropic, with the model field rewritten to the override value.
+    /// Empty/null = no override (claude-* models pass through to Anthropic as normal).</summary>
+    public string? FableModel { get; set; }
+    public string? OpusModel { get; set; }
+    public string? SonnetModel { get; set; }
+    public string? HaikuModel { get; set; }
 }
 
 public class ModelRouteRequest
@@ -1379,12 +1456,6 @@ public class ModelRouteRequest
     public bool? StripNonClaudeModels { get; set; }
 }
 
-/// <summary>
-/// Determines whether a tool should be forwarded to the local LLM.
-/// MCP tools (name starts with "mcp__") are allowed only if their server is in allowedMcpServers.
-/// Built-in tools are allowed only if they are in includedTools (empty list = allow all built-ins).
-/// This filter applies exclusively to the local LLM path — the Anthropic path is always pass-through.
-/// </summary>
 /// <summary>
 /// When Claude Code truncates a large tool result and saves it to disk, the tool result
 /// content contains a &lt;persisted-output&gt; block with the file path. This helper reads
@@ -1437,24 +1508,6 @@ public static class PersistedOutputResolver
         {
             return text;
         }
-    }
-}
-
-public static class LocalLlmToolFilter
-{
-    public static bool IsAllowed(string toolName, IList<string> includedTools, IList<string> allowedMcpTools, IList<string> blockedMcpTools)
-    {
-        if (toolName.StartsWith("mcp__", StringComparison.OrdinalIgnoreCase))
-        {
-            if (allowedMcpTools.Count == 0) return false;
-            // Each entry is a case-insensitive prefix: "mcp__conductor" allows all conductor tools
-            if (!allowedMcpTools.Any(s => toolName.StartsWith(s, StringComparison.OrdinalIgnoreCase))) return false;
-            // Blocked list takes precedence — exact match, case-insensitive
-            return !blockedMcpTools.Any(b => toolName.Equals(b, StringComparison.OrdinalIgnoreCase));
-        }
-
-        if (includedTools.Count == 0) return true;
-        return includedTools.Any(t => t.Equals(toolName, StringComparison.OrdinalIgnoreCase));
     }
 }
 
