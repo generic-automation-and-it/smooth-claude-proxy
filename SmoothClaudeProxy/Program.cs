@@ -844,7 +844,10 @@ try
     app.MapGet("/logins", (ILiteDatabase db) =>
     {
         var col = db.GetCollection<UserRecord>("users");
-        var logins = col.FindAll().Select(u => new
+        var logins = col.FindAll()
+            .OrderByDescending(u => u.LastUsedUtc)
+            .ThenByDescending(u => u.CreatedUtc)
+            .Select(u => new
         {
             Token = u.BearerToken.Length > 20
                 ? u.BearerToken[..10] + "..." + u.BearerToken[^10..]
