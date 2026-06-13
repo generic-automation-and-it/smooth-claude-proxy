@@ -885,10 +885,24 @@ try
         .WithDescription("Assigns a friendly name (e.g. 'company', 'personal') to a tracked bearer token.")
         .WithTags("Logins");
 
+    app.MapGet("/logins/{identifier}/token", (string identifier, ILiteDatabase db) =>
+    {
+        var col = db.GetCollection<UserRecord>("users");
+        var user = FindUserByIdentifier(col, identifier);
+        if (user is null)
+            return Results.NotFound(new { error = $"No user found for '{identifier}'" });
+
+        return Results.Ok(new { Token = user.BearerToken, user.Label, user.Email });
+    })
+        .WithName("GetLoginToken")
+        .WithSummary("Get an unmasked login token")
+        .WithDescription("Returns the full bearer token for a tracked login. Resolves by exact token, email, or label.")
+        .WithTags("Logins");
+
     app.MapPost("/override/{identifier}", (string identifier, ILiteDatabase db, IMemoryCache cache) =>
     {
         var col = db.GetCollection<UserRecord>("users");
-        var user = col.FindOne(x => x.Email == identifier || x.Label == identifier);
+        var user = FindUserByIdentifier(col, identifier);
         if (user is null)
             return Results.NotFound(new { error = $"No user found for '{identifier}'" });
 
@@ -1165,6 +1179,11 @@ static bool ContainsCacheControlProperty(JsonElement element)
         default:
             return false;
     }
+}
+
+static UserRecord? FindUserByIdentifier(ILiteCollection<UserRecord> col, string identifier)
+{
+    return col.FindById(identifier) ?? col.FindOne(x => x.Email == identifier || x.Label == identifier);
 }
 
 public class UserRecord
