@@ -63,6 +63,22 @@ Claude Code  -->  localhost:5066  -->  https://opencode.ai/zen/go (OpenCode Go)
 
 ## Quick Start
 
+### Pull the prebuilt image (GHCR)
+
+Published images are available from the GitHub Container Registry. Pull and run without building locally:
+
+```bash
+docker pull ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+
+docker run -d --name claude-proxy \
+  -p 5066:5066 \
+  -v ~/.claude/proxy:/data \
+  -e WORKSPACE_PATH=/data \
+  ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+```
+
+Images are published by the **Publish container** GitHub Action whenever a release is created (tagged `latest` plus the release version, e.g. `v1.2.3`), or when a `v*` tag is pushed.
+
 ### Docker Compose
 
 ```bash
