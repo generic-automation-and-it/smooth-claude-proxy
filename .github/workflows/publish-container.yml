@@ -3,10 +3,14 @@ name: Publish container
 # Builds the proxy image and pushes it to the GitHub Container Registry (GHCR)
 # so it can be pulled as a ready-to-run image.
 #
+# Versioning: fixed major.minor of 1.0; the patch number is the GitHub Actions
+# run number, so it auto-increments on every run -> 1.0.1, 1.0.2, 1.0.3, ...
+# Each run also (re)points the 1.0, 1, and latest tags at the newest image.
+#
 # Triggers:
-#   - release published   -> tags the image with the release tag + "latest"
-#   - push of a v* tag     -> tags the image with the tag version
-#   - manual dispatch      -> tags the image with the branch/sha (for testing)
+#   - release published   -> publishes a new 1.0.<run_number> image
+#   - push of a v* tag     -> publishes a new 1.0.<run_number> image
+#   - manual dispatch      -> publishes a new 1.0.<run_number> image
 on:
   release:
     types: [published]
@@ -18,6 +22,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  MAJOR_MINOR: "1.0"
 
 jobs:
   build-and-push:
@@ -40,18 +45,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute version (1.0.<run_number>)
+        id: version
+        run: echo "version=${MAJOR_MINOR}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - name: Extract image metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=ref,event=tag
-            type=ref,event=branch
-            type=sha
-            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ env.MAJOR_MINOR }}
+            type=raw,value=1
+            type=raw,value=latest
 
       - name: Build and push
         uses: docker/build-push-action@v6
