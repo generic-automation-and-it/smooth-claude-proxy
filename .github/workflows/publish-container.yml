@@ -1,10 +1,13 @@
 name: Publish container
 
-# Builds the proxy image and pushes it to the GitHub Container Registry (GHCR)
-# so it can be pulled as a ready-to-run image, and also publishes a
-# self-contained linux-x64 binary as a GitHub Release asset so the proxy can be
-# downloaded and run directly on hosts without a container runtime (e.g. the
-# Vercel sandbox, which has no Docker/Podman).
+# Builds the proxy ONCE as a self-contained linux-x64 binary and uses that
+# single artifact two ways:
+#   1. attaches it to a GitHub Release as a downloadable tarball, so the proxy
+#      can run directly on hosts without a container runtime (e.g. the Vercel
+#      sandbox, which has no Docker/Podman); and
+#   2. copies the very same binary into a container image pushed to GHCR.
+# Because both outputs come from one compile, the image and the downloadable
+# binary are guaranteed to be the exact same app.
 #
 # Versioning: fixed major.minor of 1.0; the patch number is the GitHub Actions
 # run number, so it auto-increments on every run -> 1.0.1, 1.0.2, 1.0.3, ...
@@ -28,60 +31,14 @@ env:
   MAJOR_MINOR: "1.0"
 
 jobs:
-  # Container image -> GHCR. Independent of the binary job so a flaky base-image
-  # pull from MCR can't block the release asset.
-  build-and-push:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute version (1.0.<run_number>)
-        id: version
-        run: echo "version=${MAJOR_MINOR}.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-
-      - name: Extract image metadata (tags, labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=${{ env.MAJOR_MINOR }}
-            type=raw,value=1
-            type=raw,value=latest
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Self-contained linux-x64 binary -> GitHub Release asset, for hosts without a
-  # container engine. Runs in parallel with (and independent of) the image build.
+  # Compile the app once. The resulting self-contained binary is published as a
+  # release asset here and handed to the image job below via an artifact.
   publish-binary:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
@@ -104,6 +61,15 @@ jobs:
             -o publish/linux-x64
           tar -czf smooth-claude-proxy-linux-x64.tar.gz -C publish/linux-x64 .
 
+      # Hand the exact same tarball to the image job. tar preserves the
+      # executable bit that GitHub artifacts would otherwise strip.
+      - name: Upload binary artifact for image build
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-binary
+          path: smooth-claude-proxy-linux-x64.tar.gz
+          retention-days: 1
+
       # On a published release: attach the binary to that release.
       - name: Attach binary to triggering release
         if: github.event_name == 'release'
@@ -121,3 +87,58 @@ jobs:
           name: v${{ steps.version.outputs.version }}
           make_latest: true
           files: smooth-claude-proxy-linux-x64.tar.gz
+
+  # Package the SAME binary into a container image -> GHCR. Depends on
+  # publish-binary, so the release asset is already published before this runs:
+  # a flaky base-image pull from MCR here can no longer block the release asset.
+  build-and-push:
+    needs: publish-binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-binary
+
+      - name: Extract binary into build context
+        run: |
+          mkdir -p publish/linux-x64
+          tar -xzf smooth-claude-proxy-linux-x64.tar.gz -C publish/linux-x64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.publish-binary.outputs.version }}
+            type=raw,value=${{ env.MAJOR_MINOR }}
+            type=raw,value=1
+            type=raw,value=latest
+
+      # Context is the published output; Dockerfile.runtime just COPYs it in.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: publish/linux-x64
+          file: ./Dockerfile.runtime
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,17 @@
+# Runtime-only image: packages the prebuilt self-contained linux-x64 binary
+# produced by the `publish-binary` CI job. There is no SDK and no compilation
+# here -- the build context is the published output, so the container image and
+# the released tarball are the exact same compiled app.
+#
+# For a from-source build (e.g. `docker compose up --build` locally), use the
+# multi-stage ./Dockerfile instead.
+FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
+WORKDIR /app
+COPY . .
+# GitHub artifacts drop the executable bit; restore it defensively.
+RUN chmod +x ./SmoothClaudeProxy
+ENV ASPNETCORE_URLS=http://+:5066
+RUN mkdir -p /data
+VOLUME ["/data"]
+EXPOSE 5066
+ENTRYPOINT ["./SmoothClaudeProxy"]
