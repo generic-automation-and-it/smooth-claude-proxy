@@ -77,7 +77,7 @@ docker run -d --name claude-proxy \
   ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
 ```
 
-Images are published by the **Publish container** GitHub Action whenever a release is created (tagged `latest` plus the release version, e.g. `v1.2.3`), or when a `v*` tag is pushed.
+Images are published by the **Publish container** GitHub Action. Versioning is fixed at major.minor `1.0` with the patch number set to the Actions run number, so each run publishes a new immutable `1.0.<run_number>` tag (e.g. `1.0.3`) and re-points the `1.0`, `1`, and `latest` tags at the newest image. Pin `1.0.<run_number>` for a reproducible pull, or use `latest`/`1` to always get the newest.
 
 ### Docker Compose
 
