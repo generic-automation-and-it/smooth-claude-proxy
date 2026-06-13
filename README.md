@@ -169,10 +169,12 @@ curl http://localhost:5066/health
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/logins` | List all tracked tokens with masked token, label, rate limits |
+| `GET` | `/logins/{identifier}/token` | Return the full unmasked token for a tracked login by token, email, or label |
 | `PATCH` | `/logins/{bearerToken}/label` | Assign a friendly label to a token |
 
 ```bash
 curl http://localhost:5066/logins
+curl http://localhost:5066/logins/my-label/token
 curl -X PATCH http://localhost:5066/logins/{token}/label \
   -H "Content-Type: application/json" \
   -d '"my-label"'

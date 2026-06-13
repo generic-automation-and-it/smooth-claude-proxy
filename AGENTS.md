@@ -118,6 +118,7 @@ sequenceDiagram
 |:-------|:-----|:------------|
 | `GET` | `/health` | Returns `{"status":"ok","target":"https://api.anthropic.com"}` |
 | `GET` | `/logins` | Lists all tracked keys with masked token, label, rate limit remaining, and last used |
+| `GET` | `/logins/{identifier}/token` | Returns the full token for a tracked login, resolved by exact token, email, or label |
 | `PATCH` | `/logins/{bearerToken}/label` | Assigns a friendly name (`Label`) to a tracked bearer token |
 | `POST` | `/override/{identifier}` | Activates a session by email or label; subsequent requests proxy as that user |
 | `GET` | `/override` | Returns current override session (token masked), or 404 |
@@ -165,3 +166,4 @@ sequenceDiagram
 | 2026-06-12 | Prompt caching: inject top-level `cache_control` (ephemeral) on anthropic passthrough when absent; stopped stripping client `cache_control` in OpenAI-format conversion | - |
 | 2026-06-12 | Added `StripNonClaudeModels` setting (appsettings + `/override-model`, default off): off = OpenAI-path body forwarded byte-for-byte (no conversion or filtering at all); on = full Anthropic→OpenAI conversion + slimming pipeline | - |
 | 2026-06-12 | Review fixes: structural `cache_control` detection (appended, key order preserved, non-object guard); Qwen always converts regardless of strip gate; verbatim mode streams response straight back instead of resolving Qwen-only handler; explicit `application/json` (no charset) on passthrough/verbatim content; `DELETE /override-model` response includes `StripNonClaudeModels`; removed unreachable kebab-case config fallback | - |
+| 2026-06-13 | Added `GET /logins/{identifier}/token` to return an unmasked tracked token, resolved by exact token, email, or label | - |
