@@ -6,6 +6,8 @@ A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. C
 
 Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` or fallback `LLMSERVICE_API_KEY` before startup and pass the Claude-family model overrides into the container.
 
+The alternate upstream defaults to `LlmService:BaseUrl = "https://opencode.ai/zen/go"`. Override it with `LMSTUDIO_BASE_URL` or `LlmService__BaseUrl` to route non-Claude models to any provider that exposes the Claude SDK toolkit-compatible Anthropic Messages API.
+
 ## Setup Examples
 
 ### Conductor.Build
