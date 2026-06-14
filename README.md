@@ -2,6 +2,79 @@
 
 A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to switch between accounts by label, and optional model routing to an alternate upstream such as OpenCode Go.
 
+## TL;DR
+
+Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` before startup and pass the Claude-family model overrides into the container.
+
+## Local Startup Examples
+
+### Docker (GHCR image)
+
+Create or replace the local proxy container from the published GHCR image:
+
+```bash
+sudo docker rm -f claude-proxy >/dev/null 2>&1 || true
+sudo docker run -d --name claude-proxy --restart unless-stopped \
+  -p 5066:5066 \
+  -v "$HOME/.claude/proxy:/data" \
+  -e WORKSPACE_PATH=/data \
+  -e OPENCODE_API_KEY \
+  -e LlmService__claude_fable_default_model="qwen3.7-max" \
+  -e LlmService__claude_opus_default_model="qwen3.7-plus" \
+  -e LlmService__claude_sonnet_default_model="minimax-m3" \
+  -e LlmService__claude_haiku_default_model="qwen3.6-plus" \
+  -e LOG_TOKEN_FORMAT="true" \
+  ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+```
+
+After the container has been created once, start it again with:
+
+```bash
+sudo docker start claude-proxy
+```
+
+### Podman (GHCR image)
+
+Create or replace the local proxy container with Podman:
+
+```bash
+podman rm -f claude-proxy >/dev/null 2>&1 || true
+podman run -d --name claude-proxy --restart unless-stopped \
+  -p 5066:5066 \
+  -v "$HOME/.claude/proxy:/data:Z" \
+  -e WORKSPACE_PATH=/data \
+  -e OPENCODE_API_KEY \
+  -e LlmService__claude_fable_default_model="qwen3.7-max" \
+  -e LlmService__claude_opus_default_model="qwen3.7-plus" \
+  -e LlmService__claude_sonnet_default_model="minimax-m3" \
+  -e LlmService__claude_haiku_default_model="qwen3.6-plus" \
+  -e LOG_TOKEN_FORMAT="true" \
+  ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+```
+
+After the container has been created once, start it again with:
+
+```bash
+podman start claude-proxy
+```
+
+### Podman Compose (local rebuild)
+
+Use a full rebuild when local code changes are not being picked up:
+
+```bash
+podman-compose down \
+  && podman rmi macau-v1_claude-proxy --force 2>/dev/null; \
+  podman-compose build --no-cache \
+  && podman-compose up -d
+```
+
+Point Claude Code at the running proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:5066
+```
+
 ## Start
 
 Start the proxy in detached mode so it keeps running in the background:
