@@ -9,4 +9,5 @@ services:
       - WORKSPACE_PATH=/data
       - LOG_TOKEN_FORMAT=true
       - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      - LLMSERVICE_API_KEY=${LLMSERVICE_API_KEY:-}
     restart: unless-stopped

@@ -18,8 +18,15 @@ namespace SmoothClaudeProxy.Features.Proxy;
 public sealed class ProxyForwardingMiddleware : IMiddleware
 {
     private readonly LlmServiceOptions _llm;
+    private readonly bool _logTokenFormat;
 
-    public ProxyForwardingMiddleware(IOptions<LlmServiceOptions> llm) => _llm = llm.Value;
+    public ProxyForwardingMiddleware(IOptions<LlmServiceOptions> llm, IConfiguration config)
+    {
+        _llm = llm.Value;
+        // Read from configuration so appsettings.json provides the default (true) while the
+        // LOG_TOKEN_FORMAT env var still overrides it (env config provider wins over appsettings).
+        _logTokenFormat = config.GetValue<bool>("LOG_TOKEN_FORMAT");
+    }
 
     public async Task InvokeAsync(HttpContext context, RequestDelegate next)
     {
@@ -105,7 +112,7 @@ public sealed class ProxyForwardingMiddleware : IMiddleware
             catch { /* non-JSON or parse failure — ignore */ }
         }
 
-        if (Environment.GetEnvironmentVariable("LOG_TOKEN_FORMAT") == "true" && bearerToken is not null)
+        if (_logTokenFormat && bearerToken is not null)
         {
             var parts = bearerToken.Split('.');
             var masked = bearerToken.Length > 20 ? bearerToken[..10] + "..." + bearerToken[^10..] : "***";

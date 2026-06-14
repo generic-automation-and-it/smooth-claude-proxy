@@ -2,6 +2,87 @@
 
 A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. Captures user auth details into a local LiteDB database while transparently forwarding all requests. Supports session override mode to switch between accounts by label, and optional model routing to an alternate upstream such as OpenCode Go.
 
+## TL;DR
+
+Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` or fallback `LLMSERVICE_API_KEY` before startup and pass the Claude-family model overrides into the container.
+
+The alternate upstream defaults to `LlmService:BaseUrl = "https://opencode.ai/zen/go"`. Override it with `LMSTUDIO_BASE_URL` or `LlmService__BaseUrl` to route non-Claude models to any provider that exposes the Claude SDK toolkit-compatible Anthropic Messages API.
+
+## Setup Examples
+
+### Conductor.Build
+
+For Conductor.Build workspaces, use the full [Conductor to OpenCode Go routing setup](.docs/conductor-open-go.md). It includes the fresh-sandbox startup script, Docker daemon bootstrap, GHCR pull, persistent `proxy-up.sh` helper, and shell hook for `ANTHROPIC_BASE_URL`.
+
+### Docker (GHCR image)
+
+Create or replace the local proxy container from the published GHCR image:
+
+```bash
+sudo docker rm -f claude-proxy >/dev/null 2>&1 || true
+sudo docker run -d --name claude-proxy --restart unless-stopped \
+  -p 5066:5066 \
+  -v "$HOME/.claude/proxy:/data" \
+  -e WORKSPACE_PATH=/data \
+  -e OPENCODE_API_KEY \
+  -e LLMSERVICE_API_KEY \
+  -e LlmService__claude_fable_default_model="qwen3.7-max" \
+  -e LlmService__claude_opus_default_model="qwen3.7-plus" \
+  -e LlmService__claude_sonnet_default_model="minimax-m3" \
+  -e LlmService__claude_haiku_default_model="qwen3.6-plus" \
+  -e LOG_TOKEN_FORMAT="true" \
+  ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+```
+
+After the container has been created once, start it again with:
+
+```bash
+sudo docker start claude-proxy
+```
+
+### Podman (GHCR image)
+
+Create or replace the local proxy container with Podman:
+
+```bash
+podman rm -f claude-proxy >/dev/null 2>&1 || true
+podman run -d --name claude-proxy --restart unless-stopped \
+  -p 5066:5066 \
+  -v "$HOME/.claude/proxy:/data:Z" \
+  -e WORKSPACE_PATH=/data \
+  -e OPENCODE_API_KEY \
+  -e LLMSERVICE_API_KEY \
+  -e LlmService__claude_fable_default_model="qwen3.7-max" \
+  -e LlmService__claude_opus_default_model="qwen3.7-plus" \
+  -e LlmService__claude_sonnet_default_model="minimax-m3" \
+  -e LlmService__claude_haiku_default_model="qwen3.6-plus" \
+  -e LOG_TOKEN_FORMAT="true" \
+  ghcr.io/generic-automation-and-it/smooth-claude-proxy:latest
+```
+
+After the container has been created once, start it again with:
+
+```bash
+podman start claude-proxy
+```
+
+### Podman Compose (local rebuild)
+
+Use a full rebuild when local code changes are not being picked up:
+
+```bash
+podman-compose down \
+  && podman rmi macau-v1_claude-proxy --force 2>/dev/null; \
+  podman-compose build --no-cache \
+  && podman-compose up -d
+```
+
+Point Claude Code at the running proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:5066
+```
+
 ## Start
 
 Start the proxy in detached mode so it keeps running in the background:
@@ -14,7 +95,7 @@ docker compose up --build -d
 podman-compose up --build -d
 ```
 
-If you want routed requests to use OpenCode Go, export `OPENCODE_API_KEY` before starting:
+If you want routed requests to use OpenCode Go, export `OPENCODE_API_KEY` or `LLMSERVICE_API_KEY` before starting:
 
 ```bash
 export OPENCODE_API_KEY=your-opencode-key
@@ -91,6 +172,7 @@ curl -fsSL https://github.com/generic-automation-and-it/smooth-claude-proxy/rele
 ASPNETCORE_URLS=http://+:5066 \
 WORKSPACE_PATH=$HOME/.claude/proxy \
 OPENCODE_API_KEY="$OPENCODE_API_KEY" \
+LLMSERVICE_API_KEY="$LLMSERVICE_API_KEY" \
   /opt/claude-proxy/SmoothClaudeProxy
 ```
 
@@ -109,7 +191,7 @@ docker compose logs -f
 docker compose down
 ```
 
-If you want the OpenCode route, export your API key before starting the container:
+If you want the OpenCode route, export `OPENCODE_API_KEY` or `LLMSERVICE_API_KEY` before starting the container:
 
 ```bash
 export OPENCODE_API_KEY=your-opencode-key
@@ -284,9 +366,9 @@ curl https://opencode.ai/zen/go/v1/messages \
 | `CLAUDE_PROXY_DIR` | `~/.claude/proxy` | Host path for DB and logs (compose only) |
 | `WORKSPACE_PATH` | `/data` | Container-internal workspace path |
 | `LOG_TOKEN_FORMAT` | `true` | Log bearer token format for debugging |
-| `OPENCODE_API_KEY` | unset | API key for OpenCode Go passthrough auth |
+| `OPENCODE_API_KEY` | unset | Preferred API key for OpenCode Go passthrough auth |
+| `LLMSERVICE_API_KEY` | unset | Fallback API key for alternate model routing when `OPENCODE_API_KEY` is unset |
 | `LMSTUDIO_BASE_URL` | `https://opencode.ai/zen/go` via appsettings | Optional override for the alternate model-routing base URL |
-| `LMSTUDIO_AUTH_TOKEN` | unset | Legacy fallback auth token env var for alternate model routing |
 
 ## How It Works
 
