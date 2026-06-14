@@ -101,9 +101,18 @@ sequenceDiagram
 - **Decision**: Use port 5066, derived as `sum("claudekeys" ASCII values) mod 1000 + 5000` → `1066 mod 1000 + 5000 = 66 + 5000 = 5066`. Port 5066 has no IANA-assigned service, is not blocked by common firewalls, and its origin is reproducible from the project name.
 - **Consequences**: No conflict with macOS system services. Port is project-specific and self-documenting. Docker `EXPOSE`, `ASPNETCORE_URLS`, and compose mappings must all use 5066.
 
+### LADR-006 — Prefer Authorization (Bearer) over x-api-key on Anthropic routes
+
+- **Date**: 2026-06-14
+- **Status**: Accepted
+- **Context**: Claude Code can present two credentials on the same request — a subscription OAuth token in `Authorization: Bearer …` and an API key in `x-api-key`. When both reach `api.anthropic.com`, credential selection is ambiguous and the upstream may consume the API key instead of the subscription, defeating the intent of a logged-in session.
+- **Decision**: On requests routed to Anthropic, the `Authorization` (Bearer) credential is authoritative. If a real (non-blank) Bearer token **and** an `x-api-key` are both present on the outbound request, strip `x-api-key` before forwarding so the subscription token is the only credential Anthropic sees. An API-key-only request passes through untouched, and an empty/blank `Authorization` header does not trigger the strip (it's treated as no token, matching the JWT-capture path) so the lone `x-api-key` survives. The strip runs after any active-session header override, so it applies uniformly to both inbound and session-injected credentials. Identity capture is unchanged — `apiKey` is still recorded on the `UserRecord` for tracking; only the forwarded header is dropped.
+- **Scope — Anthropic route only**: This rule lives after the `isLlmRoute` branch returns, so it never touches the alternate-upstream (opencode/LLM) paths. The opencode anthropic-format passthrough does the **opposite on purpose** — it sets *both* `Authorization: Bearer {llmToken}` and `x-api-key: {llmToken}` to the same token so whichever header style the upstream expects is present (`ProxyForwardingMiddleware.cs` ~line 160–161; the OpenAI-format path sends only `Authorization`). Do not "align" that passthrough with this LADR — sending both there is intentional, not a bug.
+- **Consequences**: A logged-in subscription always wins over a stray API key for Anthropic traffic. Requests carrying only one credential are untouched. The DB still reflects that an API key was observed even when it wasn't forwarded.
+
 ## Key Behaviors
 
-- **Auth detection order**: `x-api-key` is captured first (`authType = "API-Key"`), then `Authorization` header overwrites `authType` to `"Bearer"`. If both are present, `authType` is "Bearer" but `apiKey` is still captured from `x-api-key`.
+- **Auth detection order**: `x-api-key` is captured first (`authType = "API-Key"`), then `Authorization` header overwrites `authType` to `"Bearer"`. If both are present, `authType` is "Bearer" but `apiKey` is still captured from `x-api-key`. On the Anthropic route, when both credentials are present the outbound `x-api-key` is dropped so Anthropic only sees the Bearer token (LADR-006) — capture/tracking still records the observed `apiKey`. This stripping is Anthropic-only; the opencode anthropic-format passthrough deliberately does the opposite, sending both `Authorization` and `x-api-key` set to the same `llmToken`.
 - **JWT claim fallback**: Extracts `email` claim, then `name` claim (for future use), falling back to `sub` if no `name`. If the token isn't a JWT (opaque OAuth token), decode fails silently.
 - **Failed JWT logging exposure**: When email extraction fails, the full JWT claims JSON is logged at Information level. This may include sensitive claims. Only happens for decodable JWTs with no `email` claim.
 - **`x-user-label` header**: If present, its value becomes the `Label` for the token. The header is stripped before forwarding to Anthropic — it's proxy-only metadata.
@@ -179,3 +188,4 @@ sequenceDiagram
 | 2026-06-14 | Bound `LlmService` settings via the Options pattern (`LlmServiceOptions`, env-var bridge, internal setters) instead of manual `GetValue<>`/`GetEnvironmentVariable` resolution | - |
 | 2026-06-14 | Refactored into vertical feature slices (`Features/<Feature>/` + `Infrastructure/`); `Program.cs` reduced from 1789 to ~83 lines (LADR-005) | - |
 | 2026-06-14 | Provider-agnostic env vars `LLMSERVICE_API_KEY` / `LLMSERVICE_BASEURL` now bridge onto `LlmService:AuthToken` / `LlmService:BaseUrl` and take precedence over the legacy `OPENCODE_API_KEY` / `LMSTUDIO_BASE_URL` | - |
+| 2026-06-14 | Prefer Authorization (Bearer) over `x-api-key` on Anthropic routes — strip the outbound `x-api-key` when both credentials are present so the subscription token wins (LADR-006) | - |
