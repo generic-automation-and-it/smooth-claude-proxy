@@ -265,6 +265,41 @@ All data is stored at `~/.claude/proxy/` on the host (override with `CLAUDE_PROX
     └── claude-proxy-YYYYMMDD.log
 ```
 
+## Logs
+
+There are two log sources: the container's stdout (what Serilog writes to the console) and the rolling log file on disk under `~/.claude/proxy/logs/`. Both stream the same events.
+
+**Follow the container stdout** (`-f` keeps the terminal attached and tails new lines as they arrive; `Ctrl-C` detaches without stopping the container):
+
+```bash
+# Docker
+docker logs -f claude-proxy
+docker compose logs -f          # if started via compose
+
+# Podman
+podman logs -f claude-proxy
+podman-compose logs -f          # if started via compose
+```
+
+Show only the last N lines, then follow:
+
+```bash
+docker logs -f --tail 100 claude-proxy
+podman logs -f --tail 100 claude-proxy
+```
+
+**Tail the rolling log file** directly on the host (today's file; logs roll daily with 7-day retention):
+
+```bash
+tail -f ~/.claude/proxy/logs/claude-proxy-$(date +%Y%m%d).log
+```
+
+Watch for a routed request (model swap, OpenCode route, `200` passthrough):
+
+```bash
+docker logs -f claude-proxy | grep -E 'Model override|passthrough|<- [0-9]{3}'
+```
+
 ## API Endpoints
 
 Interactive docs available at **http://localhost:5066/scalar/v1** after startup.
