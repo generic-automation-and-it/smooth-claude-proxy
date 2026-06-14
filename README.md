@@ -6,6 +6,8 @@ A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. C
 
 Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` before startup and pass the Claude-family model overrides into the container.
 
+For Conductor.Build workspaces, use the full [Conductor to OpenCode Go routing setup](.docs/conductor-open-go.md). It includes the fresh-sandbox startup script, Docker daemon bootstrap, GHCR pull, persistent `proxy-up.sh` helper, and shell hook for `ANTHROPIC_BASE_URL`.
+
 ## Local Startup Examples
 
 ### Docker (GHCR image)
