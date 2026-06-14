@@ -723,12 +723,17 @@ public sealed class ProxyForwardingMiddleware : IMiddleware
         }
 
         // Anthropic prefers the Authorization (Bearer) credential over the API key.
-        // If both reach the proxy, Anthropic's selection is ambiguous and may consume the
-        // API key instead of the logged-in subscription. Drop the outbound x-api-key so the
-        // Bearer token is the only credential forwarded. Runs after the session override so
-        // it applies to inbound and session-injected credentials alike (LADR-006). Identity
-        // capture above is untouched — the observed apiKey is still recorded on the UserRecord.
-        if (req.Headers.ContainsKey("Authorization") && req.Headers.ContainsKey("x-api-key"))
+        // When BOTH a real Bearer token and an x-api-key are present, Anthropic's selection
+        // is ambiguous and may consume the API key instead of the logged-in subscription —
+        // so drop the outbound x-api-key, leaving the Bearer token as the only credential.
+        // An API-key-only request passes through untouched: the strip requires a non-blank
+        // Authorization value (an empty/blank Authorization header does not count, matching
+        // the JWT-capture path which treats it as no token). Runs after the session override,
+        // so session-injected credentials (always a real Bearer token) are covered too.
+        // Identity capture above is untouched — the observed apiKey is still recorded.
+        var hasBearerCredential = req.Headers.TryGetValue("Authorization", out var outboundAuth)
+            && !string.IsNullOrWhiteSpace(outboundAuth.ToString().Replace("Bearer ", ""));
+        if (hasBearerCredential && req.Headers.ContainsKey("x-api-key"))
         {
             req.Headers.Remove("x-api-key");
             logger.LogInformation("Both Authorization and x-api-key present — removed x-api-key (Bearer preferred for Anthropic)");
