@@ -12,7 +12,7 @@ The alternate upstream defaults to `LlmService:BaseUrl = "https://opencode.ai/ze
 
 ### Conductor.Build
 
-For Conductor.Build workspaces, use the full [Conductor to OpenCode Go routing setup](.docs/conductor-open-go.md). It includes the fresh-sandbox startup script, Docker daemon bootstrap, GHCR pull, persistent `proxy-up.sh` helper, and shell hook for `ANTHROPIC_BASE_URL`.
+For Conductor.Build workspaces, use the full [Conductor to OpenCode Go routing setup](.docs/conductor.build-opencode-go.md). It includes the fresh-sandbox startup script, Docker daemon bootstrap, GHCR pull, persistent `proxy-up.sh` helper, and shell hook for `ANTHROPIC_BASE_URL`.
 
 ### Docker (GHCR image)
 
