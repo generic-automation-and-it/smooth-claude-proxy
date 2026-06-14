@@ -17,7 +17,7 @@ public sealed class LlmServiceOptions
     /// <summary>Base URL of the alternate upstream (env: <c>LMSTUDIO_BASE_URL</c>).</summary>
     public string BaseUrl { get; internal set; } = "http://host.docker.internal:1234";
 
-    /// <summary>Auth token for the alternate upstream (env: <c>OPENCODE_API_KEY</c> or <c>LMSTUDIO_AUTH_TOKEN</c>).</summary>
+    /// <summary>Auth token for the alternate upstream (env: <c>OPENCODE_API_KEY</c> or <c>LLMSERVICE_API_KEY</c>).</summary>
     public string AuthToken { get; internal set; } = "";
 
     /// <summary>Whether non-claude model routing is enabled.</summary>

@@ -4,7 +4,7 @@ A .NET YARP reverse proxy that sits between Claude Code and the Anthropic API. C
 
 ## TL;DR
 
-Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` before startup and pass the Claude-family model overrides into the container.
+Run the proxy on `localhost:5066`, point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:5066`, and keep proxy state plus logs in `~/.claude/proxy`. For OpenCode Go routing, export `OPENCODE_API_KEY` or fallback `LLMSERVICE_API_KEY` before startup and pass the Claude-family model overrides into the container.
 
 ## Setup Examples
 
@@ -23,6 +23,7 @@ sudo docker run -d --name claude-proxy --restart unless-stopped \
   -v "$HOME/.claude/proxy:/data" \
   -e WORKSPACE_PATH=/data \
   -e OPENCODE_API_KEY \
+  -e LLMSERVICE_API_KEY \
   -e LlmService__claude_fable_default_model="qwen3.7-max" \
   -e LlmService__claude_opus_default_model="qwen3.7-plus" \
   -e LlmService__claude_sonnet_default_model="minimax-m3" \
@@ -48,6 +49,7 @@ podman run -d --name claude-proxy --restart unless-stopped \
   -v "$HOME/.claude/proxy:/data:Z" \
   -e WORKSPACE_PATH=/data \
   -e OPENCODE_API_KEY \
+  -e LLMSERVICE_API_KEY \
   -e LlmService__claude_fable_default_model="qwen3.7-max" \
   -e LlmService__claude_opus_default_model="qwen3.7-plus" \
   -e LlmService__claude_sonnet_default_model="minimax-m3" \
@@ -91,7 +93,7 @@ docker compose up --build -d
 podman-compose up --build -d
 ```
 
-If you want routed requests to use OpenCode Go, export `OPENCODE_API_KEY` before starting:
+If you want routed requests to use OpenCode Go, export `OPENCODE_API_KEY` or `LLMSERVICE_API_KEY` before starting:
 
 ```bash
 export OPENCODE_API_KEY=your-opencode-key
@@ -168,6 +170,7 @@ curl -fsSL https://github.com/generic-automation-and-it/smooth-claude-proxy/rele
 ASPNETCORE_URLS=http://+:5066 \
 WORKSPACE_PATH=$HOME/.claude/proxy \
 OPENCODE_API_KEY="$OPENCODE_API_KEY" \
+LLMSERVICE_API_KEY="$LLMSERVICE_API_KEY" \
   /opt/claude-proxy/SmoothClaudeProxy
 ```
 
@@ -186,7 +189,7 @@ docker compose logs -f
 docker compose down
 ```
 
-If you want the OpenCode route, export your API key before starting the container:
+If you want the OpenCode route, export `OPENCODE_API_KEY` or `LLMSERVICE_API_KEY` before starting the container:
 
 ```bash
 export OPENCODE_API_KEY=your-opencode-key
@@ -361,9 +364,9 @@ curl https://opencode.ai/zen/go/v1/messages \
 | `CLAUDE_PROXY_DIR` | `~/.claude/proxy` | Host path for DB and logs (compose only) |
 | `WORKSPACE_PATH` | `/data` | Container-internal workspace path |
 | `LOG_TOKEN_FORMAT` | `true` | Log bearer token format for debugging |
-| `OPENCODE_API_KEY` | unset | API key for OpenCode Go passthrough auth |
+| `OPENCODE_API_KEY` | unset | Preferred API key for OpenCode Go passthrough auth |
+| `LLMSERVICE_API_KEY` | unset | Fallback API key for alternate model routing when `OPENCODE_API_KEY` is unset |
 | `LMSTUDIO_BASE_URL` | `https://opencode.ai/zen/go` via appsettings | Optional override for the alternate model-routing base URL |
-| `LMSTUDIO_AUTH_TOKEN` | unset | Legacy fallback auth token env var for alternate model routing |
 
 ## How It Works
 

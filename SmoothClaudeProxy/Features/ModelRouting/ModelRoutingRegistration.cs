@@ -19,8 +19,7 @@ public static class ModelRoutingRegistration
         builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["LlmService:BaseUrl"] = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"),
-            ["LlmService:AuthToken"] = Environment.GetEnvironmentVariable("OPENCODE_API_KEY")
-                ?? Environment.GetEnvironmentVariable("LMSTUDIO_AUTH_TOKEN"),
+            ["LlmService:AuthToken"] = GetFirstNonEmptyEnvironmentVariable("OPENCODE_API_KEY", "LLMSERVICE_API_KEY"),
             ["LlmService:claude_fable_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_FABLE_DEFAULT_MODEL"),
             ["LlmService:claude_opus_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_OPUS_DEFAULT_MODEL"),
             ["LlmService:claude_sonnet_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_SONNET_DEFAULT_MODEL"),
@@ -38,6 +37,18 @@ public static class ModelRoutingRegistration
             "qwen/qwen2.5-coder-14b", (sp, key) => new Qwen2_5ResponseHandler());
 
         return builder;
+    }
+
+    private static string? GetFirstNonEmptyEnvironmentVariable(params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            if (!string.IsNullOrEmpty(value))
+                return value;
+        }
+
+        return null;
     }
 
     /// <summary>

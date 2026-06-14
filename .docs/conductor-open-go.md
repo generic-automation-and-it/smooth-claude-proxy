@@ -24,10 +24,11 @@ and cosmetic, not a routing failure.
 
 ## Prerequisites / knobs
 
-- **`OPENCODE_API_KEY`** — required. **`export` it in your shell before running** —
-  do **not** paste a real key into the script block below, because this file is
-  tracked in the repo and a committed key would leak. The container starts without
-  it but every routed request 401s. The key is written only to
+- **`OPENCODE_API_KEY` / `LLMSERVICE_API_KEY`** — one is required.
+  **`export` it in your shell before running** — do **not** paste a real key into
+  the script block below, because this file is tracked in the repo and a committed
+  key would leak. `OPENCODE_API_KEY` wins when both are set. The container starts
+  without a key but every routed request 401s. The key is written only to
   `~/.claude/proxy/proxy.env` (mode 600, outside the repo) — never to a tracked file
   and never printed to the console (the verify step redirects it to `/dev/null`).
 - **`GHCR_TOKEN` / `GHCR_USER`** — only needed if the GHCR package is private. With
@@ -68,8 +69,10 @@ ENV_FILE="$PROXY_DIR/proxy.env"
 HELPER="$PROXY_DIR/proxy-up.sh"
 
 # Prefer `export OPENCODE_API_KEY=...` in your shell before running this script.
+# If unset, `LLMSERVICE_API_KEY` is used by the proxy as the fallback auth env var.
 # Do NOT commit a real key here — this file is tracked in the repo.
-OPENCODE_API_KEY="${OPENCODE_API_KEY:-REPLACE_VIA_EXPORT}"
+OPENCODE_API_KEY="${OPENCODE_API_KEY:-}"
+LLMSERVICE_API_KEY="${LLMSERVICE_API_KEY:-}"
 
 mkdir -p "$PROXY_DIR"
 
@@ -88,6 +91,7 @@ sudo dnf install -y docker
 umask 077                                   # secrets: owner-read/write only
 cat > "$ENV_FILE" <<EOF
 OPENCODE_API_KEY=$OPENCODE_API_KEY
+LLMSERVICE_API_KEY=$LLMSERVICE_API_KEY
 WORKSPACE_PATH=/data
 LlmService__claude_fable_default_model=qwen3.7-max
 LlmService__claude_opus_default_model=qwen3.7-plus
@@ -188,9 +192,11 @@ export ANTHROPIC_BASE_URL=http://localhost:5066
 # ── 10) Verify ──────────────────────────────────────────────────────────
 echo "── verify ─────────────────────────────────────────"
 sudo docker ps --filter name=claude-proxy --format 'container: {{.Names}} {{.Status}}'
-sudo docker exec claude-proxy printenv OPENCODE_API_KEY >/dev/null 2>&1 \
-  && echo "OPENCODE_API_KEY: present in container ✅" \
-  || echo "OPENCODE_API_KEY: MISSING in container ❌ (check $ENV_FILE)"
+if sudo docker exec claude-proxy sh -c '[ -n "$OPENCODE_API_KEY" ] || [ -n "$LLMSERVICE_API_KEY" ]'; then
+  echo "LLM API key: present in container ✅"
+else
+  echo "LLM API key: MISSING in container ❌ (check $ENV_FILE)"
+fi
 curl -fsS localhost:5066/health && echo || echo "health: not responding yet (give it a few seconds)"
 
 echo "Setup complete. ANTHROPIC_BASE_URL is set for this shell and persisted for new shells."
