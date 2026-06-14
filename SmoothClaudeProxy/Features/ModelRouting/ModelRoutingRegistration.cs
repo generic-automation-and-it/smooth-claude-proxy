@@ -18,8 +18,8 @@ public static class ModelRoutingRegistration
     {
         builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["LlmService:BaseUrl"] = Environment.GetEnvironmentVariable("LMSTUDIO_BASE_URL"),
-            ["LlmService:AuthToken"] = GetFirstNonEmptyEnvironmentVariable("OPENCODE_API_KEY", "LLMSERVICE_API_KEY"),
+            ["LlmService:BaseUrl"] = GetFirstNonEmptyEnvironmentVariable("LLMSERVICE_BASEURL", "LMSTUDIO_BASE_URL"),
+            ["LlmService:AuthToken"] = GetFirstNonEmptyEnvironmentVariable("LLMSERVICE_API_KEY", "OPENCODE_API_KEY"),
             ["LlmService:claude_fable_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_FABLE_DEFAULT_MODEL"),
             ["LlmService:claude_opus_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_OPUS_DEFAULT_MODEL"),
             ["LlmService:claude_sonnet_default_model"] = Environment.GetEnvironmentVariable("CLAUDE_SONNET_DEFAULT_MODEL"),

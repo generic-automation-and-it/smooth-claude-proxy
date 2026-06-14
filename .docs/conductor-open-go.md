@@ -24,13 +24,16 @@ and cosmetic, not a routing failure.
 
 ## Prerequisites / knobs
 
-- **`OPENCODE_API_KEY` / `LLMSERVICE_API_KEY`** — one is required.
+- **`LLMSERVICE_API_KEY`** — required (the provider-agnostic auth env var).
   **`export` it in your shell before running** — do **not** paste a real key into
   the script block below, because this file is tracked in the repo and a committed
-  key would leak. `OPENCODE_API_KEY` wins when both are set. The container starts
-  without a key but every routed request 401s. The key is written only to
-  `~/.claude/proxy/proxy.env` (mode 600, outside the repo) — never to a tracked file
-  and never printed to the console (the verify step redirects it to `/dev/null`).
+  key would leak. The container starts without a key but every routed request 401s.
+  The key is written only to `~/.claude/proxy/proxy.env` (mode 600, outside the repo)
+  — never to a tracked file and never printed to the console (the verify step checks
+  presence only).
+- **`LLMSERVICE_BASEURL`** — optional. Overrides the upstream LLM URL
+  (`LlmService:BaseUrl`, default `https://opencode.ai/zen/go`). Set it to point the
+  proxy at a different Anthropic-compatible endpoint.
 - **`GHCR_TOKEN` / `GHCR_USER`** — only needed if the GHCR package is private. With
   a public package the pull needs no auth.
 - Model names use the **no-hyphen** form (`qwen3.7-plus`, not `qwen-3.7-plus`).
@@ -68,11 +71,11 @@ PROXY_DIR="$HOME/.claude/proxy"
 ENV_FILE="$PROXY_DIR/proxy.env"
 HELPER="$PROXY_DIR/proxy-up.sh"
 
-# Prefer `export OPENCODE_API_KEY=...` in your shell before running this script.
-# If unset, `LLMSERVICE_API_KEY` is used by the proxy as the fallback auth env var.
+# Prefer `export LLMSERVICE_API_KEY=...` in your shell before running this script.
 # Do NOT commit a real key here — this file is tracked in the repo.
-OPENCODE_API_KEY="${OPENCODE_API_KEY:-}"
 LLMSERVICE_API_KEY="${LLMSERVICE_API_KEY:-}"
+# Optional: override the upstream LLM URL (defaults to opencode.ai/zen/go).
+LLMSERVICE_BASEURL="${LLMSERVICE_BASEURL:-https://opencode.ai/zen/go}"
 
 mkdir -p "$PROXY_DIR"
 
@@ -90,8 +93,8 @@ sudo dnf install -y docker
 # ── 4) Write the container env file (single source of truth for config) ─
 umask 077                                   # secrets: owner-read/write only
 cat > "$ENV_FILE" <<EOF
-OPENCODE_API_KEY=$OPENCODE_API_KEY
 LLMSERVICE_API_KEY=$LLMSERVICE_API_KEY
+LLMSERVICE_BASEURL=$LLMSERVICE_BASEURL
 WORKSPACE_PATH=/data
 LlmService__claude_fable_default_model=qwen3.7-max
 LlmService__claude_opus_default_model=qwen3.7-plus
@@ -192,10 +195,10 @@ export ANTHROPIC_BASE_URL=http://localhost:5066
 # ── 10) Verify ──────────────────────────────────────────────────────────
 echo "── verify ─────────────────────────────────────────"
 sudo docker ps --filter name=claude-proxy --format 'container: {{.Names}} {{.Status}}'
-if sudo docker exec claude-proxy sh -c '[ -n "$OPENCODE_API_KEY" ] || [ -n "$LLMSERVICE_API_KEY" ]'; then
-  echo "LLM API key: present in container ✅"
+if sudo docker exec claude-proxy sh -c '[ -n "$LLMSERVICE_API_KEY" ]'; then
+  echo "LLMSERVICE_API_KEY: present in container ✅"
 else
-  echo "LLM API key: MISSING in container ❌ (check $ENV_FILE)"
+  echo "LLMSERVICE_API_KEY: MISSING in container ❌ (check $ENV_FILE)"
 fi
 curl -fsS localhost:5066/health && echo || echo "health: not responding yet (give it a few seconds)"
 
