@@ -79,10 +79,19 @@ sequenceDiagram
 ### LADR-003 — Single Program.cs Top-Level Statements
 
 - **Date**: 2026-03-13
-- **Status**: Accepted
+- **Status**: Superseded by LADR-005 (2026-06-14)
 - **Context**: The proxy has exactly two concerns: middleware extraction and background DB writes.
 - **Decision**: Keep everything in `Program.cs` with `UserRecord`, `UserUpsertWorker`, `ActiveSession`, `LabelRequest`, and `AppJsonContext` as the only separate types. No service layer, no repository pattern.
-- **Consequences**: Fast to read and modify. `Program.cs` is currently at ~453 lines — past the original ~300-line threshold. Next significant feature should extract the request middleware into `ProxyMiddleware.cs`.
+- **Consequences**: Fast to read and modify. Grew to ~1789 lines — well past the threshold — which is what prompted LADR-005.
+
+### LADR-005 — Vertical Slice / Feature Folders
+
+- **Date**: 2026-06-14
+- **Status**: Accepted
+- **Context**: `Program.cs` reached 1789 lines mixing every concern (auth extraction, model routing, LLM conversion, user tracking, endpoints, DTOs). Editing one feature meant scrolling past all others.
+- **Decision**: Organize code by feature under `Features/<Feature>/` (one namespace per feature, `SmoothClaudeProxy.Features.<Feature>`), with cross-cutting setup under `Infrastructure/`. Each feature owns its types, helpers, endpoint group (`Map<Feature>Endpoints` extension), and DI registration (`Add<Feature>` extension). The core request pipeline moved to `Features/Proxy/ProxyForwardingMiddleware.cs` as an `IMiddleware`. `Program.cs` is now an ~83-line composition root.
+- **Feature map**: `Proxy` (forwarding middleware, JWT identity, health) · `ModelRouting` (LlmServiceOptions, ModelRouteSettings/Request, override resolver, request filter, response handlers, `/override-model`) · `Logins` (UserRecord, UserUpsertWorker, `/logins`) · `Sessions` (ActiveSession, `/override`) · `Usage` (`/current`, `/usage`) · `Infrastructure` (Serilog setup, AppJsonContext).
+- **Consequences**: Each feature is editable in isolation; the composition root reads top-to-bottom. Cross-feature references use explicit `using` directives (no global usings). Behavior is unchanged — startup config, env-var overrides, runtime `/override-model` mutation, and the LLM-routing branches all verified post-refactor.
 
 ### LADR-004 — Port 5066
 
@@ -140,7 +149,7 @@ sequenceDiagram
 - **LiteDB AOT incompatibility**: LiteDB uses reflection-heavy BsonMapper. If native AOT is needed in the future, replace with SQLite + Dapper or raw `Microsoft.Data.Sqlite`. Do not attempt `PublishAot=true` with LiteDB — it will compile but fail at runtime with missing metadata.
 - **PublishTrimmed removed**: `TrimMode=partial` strips `JsonTypeInfo` metadata for endpoint return types (`List<UserRecord>` etc.), causing 500s on all `MapGet` endpoints. The ASP.NET Core Request Delegate Generator emits trimming-incompatible serialization code. `PublishReadyToRun=true` is retained for startup speed.
 - **Token format uncertainty**: Claude Code's auth token may not be a JWT. If Anthropic changes to opaque tokens, the JWT decode path returns null gracefully. The `LOG_TOKEN_FORMAT=true` env var exists specifically to diagnose token format changes.
-- **Program.cs extraction**: At ~453 lines, the file is past the threshold where extraction becomes worthwhile. The request middleware should move to `ProxyMiddleware.cs` before the next feature is added.
+- **Program.cs extraction**: Done (LADR-005, 2026-06-14). The middleware now lives in `Features/Proxy/ProxyForwardingMiddleware.cs` and all features are sliced into `Features/<Feature>/`; `Program.cs` is an ~83-line composition root.
 
 ## Changelog
 
@@ -167,3 +176,5 @@ sequenceDiagram
 | 2026-06-12 | Added `StripNonClaudeModels` setting (appsettings + `/override-model`, default off): off = OpenAI-path body forwarded byte-for-byte (no conversion or filtering at all); on = full Anthropic→OpenAI conversion + slimming pipeline | - |
 | 2026-06-12 | Review fixes: structural `cache_control` detection (appended, key order preserved, non-object guard); Qwen always converts regardless of strip gate; verbatim mode streams response straight back instead of resolving Qwen-only handler; explicit `application/json` (no charset) on passthrough/verbatim content; `DELETE /override-model` response includes `StripNonClaudeModels`; removed unreachable kebab-case config fallback | - |
 | 2026-06-13 | Added `GET /logins/{identifier}/token` to return an unmasked tracked token, resolved by exact token, email, or label | - |
+| 2026-06-14 | Bound `LlmService` settings via the Options pattern (`LlmServiceOptions`, env-var bridge, internal setters) instead of manual `GetValue<>`/`GetEnvironmentVariable` resolution | - |
+| 2026-06-14 | Refactored into vertical feature slices (`Features/<Feature>/` + `Infrastructure/`); `Program.cs` reduced from 1789 to ~83 lines (LADR-005) | - |

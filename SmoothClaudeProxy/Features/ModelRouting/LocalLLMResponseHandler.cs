@@ -1,5 +1,8 @@
 using System.Text.Json;
 
+
+namespace SmoothClaudeProxy.Features.ModelRouting;
+
 /// <summary>
 /// Handles converting local LLM responses to Anthropic SSE format.
 /// Implement this interface for each model type to handle model-specific response processing.

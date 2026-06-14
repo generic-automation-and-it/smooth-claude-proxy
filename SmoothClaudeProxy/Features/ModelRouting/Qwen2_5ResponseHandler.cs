@@ -1,6 +1,9 @@
 using System.Text;
 using System.Text.Json;
 
+
+namespace SmoothClaudeProxy.Features.ModelRouting;
+
 /// <summary>
 /// Handles Qwen2.5-Coder model responses (LM Studio compatible).
 /// Converts OpenAI-compatible chat completion format with tool_calls array
