@@ -14,15 +14,14 @@ name: Publish container
 # Each run also (re)points the 1.0, 1, and latest tags at the newest image.
 #
 # Triggers:
-#   - release published   -> publishes a new 1.0.<run_number> image + attaches binary to that release
-#   - push of a v* tag     -> publishes a new 1.0.<run_number> image + cuts release v1.0.<run_number>
-#   - manual dispatch      -> publishes a new 1.0.<run_number> image + cuts release v1.0.<run_number>
+#   - push to main touching SmoothClaudeProxy/** -> publishes a new 1.0.<run_number> image + cuts release v1.0.<run_number>
+#   - manual dispatch                            -> publishes a new 1.0.<run_number> image + cuts release v1.0.<run_number>
 on:
-  release:
-    types: [published]
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - "SmoothClaudeProxy/**"
   workflow_dispatch:
 
 env:
@@ -70,17 +69,9 @@ jobs:
           path: smooth-claude-proxy-linux-x64.tar.gz
           retention-days: 1
 
-      # On a published release: attach the binary to that release.
-      - name: Attach binary to triggering release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: smooth-claude-proxy-linux-x64.tar.gz
-
-      # On tag push / manual dispatch: cut a v1.0.<run_number> release marked
-      # latest so releases/latest/download/<asset> always resolves.
+      # Cut a v1.0.<run_number> release marked latest so
+      # releases/latest/download/<asset> always resolves.
       - name: Cut release with binary
-        if: github.event_name != 'release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
