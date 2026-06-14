@@ -722,6 +722,18 @@ public sealed class ProxyForwardingMiddleware : IMiddleware
             logger.LogInformation("Auth overridden from active session: {Email}", activeSession.Email);
         }
 
+        // Anthropic prefers the Authorization (Bearer) credential over the API key.
+        // If both reach the proxy, Anthropic's selection is ambiguous and may consume the
+        // API key instead of the logged-in subscription. Drop the outbound x-api-key so the
+        // Bearer token is the only credential forwarded. Runs after the session override so
+        // it applies to inbound and session-injected credentials alike (LADR-006). Identity
+        // capture above is untouched — the observed apiKey is still recorded on the UserRecord.
+        if (req.Headers.ContainsKey("Authorization") && req.Headers.ContainsKey("x-api-key"))
+        {
+            req.Headers.Remove("x-api-key");
+            logger.LogInformation("Both Authorization and x-api-key present — removed x-api-key (Bearer preferred for Anthropic)");
+        }
+
         var responseBufferingFeature = context.Features
             .Get<Microsoft.AspNetCore.Http.Features.IHttpResponseBodyFeature>();
         responseBufferingFeature?.DisableBuffering();
