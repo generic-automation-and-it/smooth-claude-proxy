@@ -87,6 +87,13 @@ export PATH="$HOME/.dotnet:$HOME/.dotnet/tools:$PATH"
 # ── 2) OpenCode (latest) — installer appends its own PATH line to ~/.bashrc
 curl -fsSL https://opencode.ai/install | bash
 
+# ── 2b) Additional CLIs: Claude Code, Codex, pi ─────────────────────────
+curl -fsSL https://claude.ai/install.sh | bash
+# bubblewrap is the Linux sandbox runtime Codex requires at runtime.
+sudo dnf install -y bubblewrap
+curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
+curl -fsSL https://pi.dev/install.sh | sh
+
 # ── 3) Docker engine ───────────────────────────────────────────────────
 sudo dnf install -y docker
 
