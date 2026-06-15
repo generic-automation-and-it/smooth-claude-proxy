@@ -200,6 +200,10 @@ if ! grep -q 'claude-yolo' "$HOME/.bashrc" 2>/dev/null; then
   echo "alias claude-yolo='claude --dangerously-skip-permissions'" >> "$HOME/.bashrc"
 fi
 
+if ! grep -q 'codex-yolo' "$HOME/.bashrc" 2>/dev/null; then
+  echo "alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'" >> "$HOME/.bashrc"
+fi
+
 # ── 9) Make THIS shell use the proxy immediately (no reopen needed) ─────
 export ANTHROPIC_BASE_URL=http://localhost:5066
 
